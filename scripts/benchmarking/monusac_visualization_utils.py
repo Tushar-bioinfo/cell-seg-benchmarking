@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -343,6 +342,8 @@ def plot_sample_triptych(
     overlay_alpha: float = DEFAULT_OVERLAY_ALPHA,
     seed: int = 7,
 ) -> tuple[plt.Figure, np.ndarray]:
+    import matplotlib.pyplot as plt
+
     color_mask = colorize_instance_mask(instance_mask, seed=seed)
     overlay = overlay_instance_mask(image, instance_mask, alpha=overlay_alpha, seed=seed)
 
@@ -373,6 +374,8 @@ def plot_resize_comparison(
     overlay_alpha: float = DEFAULT_OVERLAY_ALPHA,
     seed: int = 7,
 ) -> tuple[plt.Figure, np.ndarray]:
+    import matplotlib.pyplot as plt
+
     fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
 
     panels = (
