@@ -3,6 +3,8 @@
 ## Files in This Folder
 
 - `monusac_download_extract.ipynb`: Downloads `RationAI/MoNuSAC` from Hugging Face, merges `train` and `test`, and exports paired image and mask PNG files into `../../data/Monusac/`.
+- `monusac_annotation_qc.ipynb`: Loads exported MoNuSAC image/mask pairs, overlays the instance mask on the RGB patch, then rescales a 40x patch to 20x with a label-aware mask resize and shows the overlay again for QC.
+- `monusac_visualization_utils.py`: Shared helper functions for MoNuSAC sample lookup, overlay rendering, and 40x to 20x image/mask rescaling.
 
 ## Pulling Latest Changes on HPC
 
@@ -53,8 +55,15 @@ Open:
 scripts/benchmarking/monusac_download_extract.ipynb
 ```
 
+For annotation QC after export, open:
+
+```text
+scripts/benchmarking/monusac_annotation_qc.ipynb
+```
+
 Important:
 
 - Run the notebook in place from `scripts/benchmarking/`.
 - The notebook writes data relative to its location and expects `../../data/Monusac/`.
 - If Hugging Face requests authentication, run `hf auth login` before executing the download cell.
+- The QC notebook also accepts `MONUSAC_ROOT` if your exported data lives outside the repo's default `data/Monusac/` path.
