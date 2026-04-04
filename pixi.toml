@@ -1,0 +1,95 @@
+[workspace]
+name = "cell-seg"
+version = "0.1.0"
+description = "HPC environments for WSI preprocessing and 4-model cell segmentation inference"
+authors = ["Tushar Singh"]
+channels = ["conda-forge", "nvidia"]
+platforms = ["linux-64"]
+
+[system-requirements]
+cuda = "12.1"
+
+[dependencies]
+python = "3.10.*"
+
+# Notebook + kernel
+jupyterlab = ">=4.2,<5"
+ipykernel = ">=6.29,<7"
+ipywidgets = ">=8.1,<9"
+pip = ">=24,<26"
+
+# Shared scientific stack
+numpy = "1.26.*"
+pandas = ">=1.5,<2.0"
+matplotlib = ">=3.8,<3.10"
+pillow = ">=10.2,<11"
+tqdm = ">=4.66,<5"
+openslide = ">=4.0,<5"
+openslide-python = ">=1.3,<2"
+natsort = ">=8.4,<9"
+scipy = ">=1.12,<1.16"
+imageio = ">=2.34,<3"
+
+[feature.torch-stack.dependencies]
+monai = ">=1.4,<1.5"
+pytorch = "2.4.*"
+torchvision = "0.19.*"
+torchaudio = "2.4.*"
+cuda-version = "12.1.*"
+
+[activation.env]
+OMP_NUM_THREADS = "8"
+MKL_NUM_THREADS = "8"
+OPENBLAS_NUM_THREADS = "8"
+NUMEXPR_NUM_THREADS = "8"
+PYTHONNOUSERSITE = "1"
+
+[feature.cellvit.tasks]
+kernel-install = "python -m ipykernel install --user --name cellvit-infer --display-name \"Python (cellvit-infer)\""
+gpu-check = "python -c \"import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('cuda_count', torch.cuda.device_count()); print('device0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')\""
+model-install = "python -m pip install 'setuptools<=65.6.3' 'cellvit==1.0.9'"
+
+[feature.cellsam.tasks]
+kernel-install = "python -m ipykernel install --user --name cellsam-infer --display-name \"Python (cellsam-infer)\""
+gpu-check = "python -c \"import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('cuda_count', torch.cuda.device_count()); print('device0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')\""
+model-install = "python -m pip install 'git+https://github.com/vanvalenlab/cellSAM.git'"
+
+[feature.cellsam.pypi-dependencies]
+opencv-python-headless = ">=4.10,<5"
+
+[feature.cellpose.tasks]
+kernel-install = "python -m ipykernel install --user --name cellpose-infer --display-name \"Python (cellpose-infer)\""
+gpu-check = "python -c \"import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('cuda_count', torch.cuda.device_count()); print('device0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')\""
+model-install = "python -m pip install 'git+https://www.github.com/mouseland/cellpose.git'"
+
+[feature.cellpose.pypi-dependencies]
+opencv-python-headless = ">=4.10,<5"
+
+[feature.stardist.tasks]
+kernel-install = "python -m ipykernel install --user --name stardist-infer --display-name \"Python (stardist-infer)\""
+gpu-check = "env LD_LIBRARY_PATH=\"$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}\" python -s -c \"import numpy, tensorflow as tf; print('numpy', numpy.__version__); print('tensorflow', tf.__version__); print('gpus', tf.config.list_physical_devices('GPU'))\""
+model-install = "env LD_LIBRARY_PATH=\"$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}\" python -s -c \"import numpy, tensorflow as tf, stardist, csbdeep, tifffile; print('numpy', numpy.__version__); print('tensorflow', tf.__version__); print('stardist', stardist.__version__)\""
+dep-check = "python -m pip check"
+doctor = "env LD_LIBRARY_PATH=\"$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}\" python -s -c \"import os, sys, numpy, google.protobuf as pb, ml_dtypes, tensorflow as tf; print('python', sys.version.split()[0]); print('CONDA_PREFIX', os.environ.get('CONDA_PREFIX')); print('LD_LIBRARY_PATH', os.environ.get('LD_LIBRARY_PATH')); print('numpy', numpy.__version__, numpy.__file__); print('protobuf', pb.__version__, pb.__file__); print('ml_dtypes', ml_dtypes.__version__, ml_dtypes.__file__); print('tensorflow', tf.__version__, tf.__file__)\""
+repair-tf215 = "python -s -m pip install --upgrade --force-reinstall \"numpy<2\" \"protobuf<5\" \"ml-dtypes<0.4\""
+
+[feature.stardist.pypi-dependencies]
+tensorflow = { version = "==2.15.*", extras = ["and-cuda"] }
+stardist = ">=0.9,<1"
+csbdeep = ">=0.8,<1"
+tifffile = ">=2024.8,<2026"
+opencv-python-headless = ">=4.10,<5"
+numpy = ">=1.24,<2"
+protobuf = ">=3.20.3,<5"
+
+[environments]
+default = { features = ["torch-stack"], solve-group = "torch" }
+cellvit = { features = ["cellvit", "torch-stack"], solve-group = "torch" }
+cellsam = { features = ["cellsam", "torch-stack"], solve-group = "torch" }
+cellpose = { features = ["cellpose", "torch-stack"], solve-group = "torch" }
+stardist = { features = ["stardist"], solve-group = "stardist" }
+
+[tasks]
+kernel-install = "python -m ipykernel install --user --name cell-vit-hpc --display-name \"Python (cell-vit-hpc)\""
+lab = "jupyter lab --no-browser --port 8888"
+gpu-check = "python -c \"import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('cuda_count', torch.cuda.device_count()); print('device0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')\""
