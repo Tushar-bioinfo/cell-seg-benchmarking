@@ -28,7 +28,7 @@ cd /share/lab_teng/trainee/tusharsingh/cell-seg
 which pixi
 pixi --version
 
-pixi add python=3.10 jupyterlab ipykernel numpy pandas matplotlib pillow tqdm scikit-image openslide openslide-python opencv monai pytorch torchvision torchaudio
+pixi add python=3.10 jupyterlab ipykernel numpy pandas datasets matplotlib pillow tqdm scikit-image openslide openslide-python opencv monai pytorch torchvision torchaudio
 
 pixi run python -m ipykernel install --user --name cellseg-pixi --display-name "Python (cellseg-pixi)"
 echo "Install finished successfully"
