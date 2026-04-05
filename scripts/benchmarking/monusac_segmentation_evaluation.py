@@ -16,8 +16,11 @@ Design notes
 - One-to-one instance matching is performed globally with the Hungarian algorithm.
 - Assigned pairs below the IoU threshold are discarded.
 - Single-mask file loading is supported for PNG and TIFF inputs.
-- Folder-level batch evaluation and CSV export are supported for simple
-  filename-stem based mask pairing.
+- Generic folder-level batch evaluation is supported for simple filename-stem
+  based pairing.
+- MoNuSAC model batch evaluation reads mask locations directly from each
+  model's `predictions.csv` manifest instead of reconstructing paths from
+  directory naming assumptions.
 """
 
 import argparse
@@ -96,36 +99,26 @@ UInt8Array = npt.NDArray[np.uint8]
 FloatArray = npt.NDArray[np.float64]
 CSVRow = dict[str, Any]
 
-SUPPORTED_MASK_SUFFIXES: frozenset[str] = frozenset({".png", ".tif", ".tiff"})
-DEFAULT_DATASET_FOLDER = "all_merged"
-DEFAULT_GT_LEAF_DIR_NAME = "png_files"
-DEFAULT_PRED_LEAF_DIR_NAME = "predicted_mask"
-
-# Customize these GT tokens if your ground-truth mask files use a different
-# suffix than the default MoNuSAC-style `_mask`.
-DEFAULT_GT_MASK_SUFFIX_TOKENS: tuple[str, ...] = ("_mask",)
-
-# Customize these normalization tokens if GT and prediction filenames differ
-# slightly, for example `tile_mask.png` vs `tile_image.png` or
-# `tile_prediction.png`. Matching happens after these tokens are stripped from
-# the stem, so keep the list conservative.
-DEFAULT_MATCH_SUFFIX_TOKENS: tuple[str, ...] = (
-    "_mask",
-    "_masks",
-    "_image",
-    "_images",
-    "_pred",
-    "_preds",
-    "_prediction",
-    "_predictions",
-    "_predicted",
-    "_predicted_mask",
-    "_instance",
-    "_instances",
-    "_label",
-    "_labels",
-    "_seg",
-    "_segmentation",
+DEFAULT_PREDICTIONS_MANIFEST_NAME = "predictions.csv"
+REQUIRED_PREDICTIONS_COLUMNS: tuple[str, ...] = (
+    "predicted_mask_path",
+    "mask_path",
+)
+RELATIVE_IMAGE_PATH_COLUMNS: tuple[str, ...] = (
+    "relative_image_path",
+    "image_path",
+)
+PATIENT_ID_COLUMNS: tuple[str, ...] = (
+    "patient_id",
+    "patient",
+)
+ROW_ID_COLUMNS: tuple[str, ...] = (
+    "patch_id",
+    "relative_image_path",
+    "image_path",
+    "predicted_mask_relative_path",
+    "predicted_mask_name",
+    "predicted_mask_path",
 )
 
 FLAT_METRIC_FIELDNAMES: tuple[str, ...] = (
@@ -167,31 +160,15 @@ CSV_FIELDNAMES: tuple[str, ...] = (
     *FLAT_METRIC_FIELDNAMES,
 )
 
-
-@dataclass(frozen=True)
-class MaskFileRecord:
-    """One discovered GT or prediction mask with a normalized match key."""
-
-    path: Path
-    patient_id: str
-    relative_path: Path
-    stem: str
-    normalized_stem: str
-    match_key: str
-
-
 @dataclass(frozen=True)
 class ModelEvaluationSummary:
     """High-level processing summary for one model directory."""
 
     model_name: str
-    matched_pair_count: int
+    manifest_row_count: int
     ok_count: int
     error_count: int
-    missing_prediction_count: int
-    missing_ground_truth_count: int
-    duplicate_gt_count: int
-    duplicate_prediction_count: int
+    manifest_path: Path
     output_csv: Path
 
 
@@ -1017,11 +994,6 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _default_gt_root() -> Path:
-    """Return the default patched MoNuSAC GT root for this repository."""
-    return _repo_root() / "data" / "Monusac" / "rescaled" / "patched"
-
-
 def _default_prediction_root() -> Path:
     """Return the default MoNuSAC prediction root.
 
@@ -1044,342 +1016,206 @@ def _default_output_dir(prediction_root: Path) -> Path:
     return prediction_root / "_evaluation"
 
 
-def _resolve_dataset_dir(base_root: str | Path, dataset_folder: str) -> Path:
-    """Resolve a dataset directory from either a base root or the dataset folder itself."""
-    resolved_root = Path(base_root).expanduser().resolve()
-    candidates: list[Path] = []
+def _read_predictions_manifest(manifest_path: Path) -> tuple[list[CSVRow], tuple[str, ...]]:
+    """Read one model's `predictions.csv` manifest with stable string keys."""
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Predictions manifest not found: {manifest_path}")
 
-    if dataset_folder:
-        if resolved_root.name == dataset_folder:
-            candidates.append(resolved_root)
-        candidates.append(resolved_root / dataset_folder)
+    with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(
+                f"Predictions manifest is missing a header row: {manifest_path}"
+            )
+        rows = [dict(row) for row in reader]
 
-    candidates.append(resolved_root)
-
-    checked: list[Path] = []
-    for candidate in candidates:
-        if candidate in checked:
-            continue
-        checked.append(candidate)
-        if candidate.is_dir():
-            return candidate
-
-    checked_text = ", ".join(str(path) for path in checked)
-    raise NotADirectoryError(
-        "Could not resolve the dataset directory. "
-        f"Checked: {checked_text}"
-    )
+    return rows, tuple(reader.fieldnames)
 
 
-def _is_supported_mask_file(path: Path) -> bool:
-    """Return whether `path` looks like a supported mask image file."""
-    return path.is_file() and path.suffix.lower() in SUPPORTED_MASK_SUFFIXES
+def _validate_predictions_manifest_columns(
+    manifest_path: Path,
+    fieldnames: Sequence[str],
+) -> None:
+    """Fail fast when `predictions.csv` is missing required path columns."""
+    missing_columns = [
+        column for column in REQUIRED_PREDICTIONS_COLUMNS if column not in fieldnames
+    ]
+    if missing_columns:
+        missing_text = ", ".join(missing_columns)
+        raise ValueError(
+            f"Missing required column(s) in {manifest_path}: {missing_text}. "
+            "MoNuSAC evaluation requires `predicted_mask_path` from the inference "
+            "pipeline and the propagated GT tile column `mask_path` from the tile manifest."
+        )
 
 
-def _iter_patient_leaf_dirs(
-    dataset_dir: Path,
-    leaf_dir_name: str,
-) -> list[tuple[str, Path]]:
-    """Return `(patient_id, leaf_dir)` pairs beneath one dataset directory."""
-    patient_leaf_dirs: list[tuple[str, Path]] = []
-    for patient_dir in sorted(path for path in dataset_dir.iterdir() if path.is_dir()):
-        leaf_dir = patient_dir if not leaf_dir_name else patient_dir / leaf_dir_name
-        if leaf_dir.is_dir():
-            patient_leaf_dirs.append((patient_dir.name, leaf_dir))
-    return patient_leaf_dirs
+def _manifest_cell(row: CSVRow, column: str) -> str:
+    """Return one manifest cell as a stripped string."""
+    value = row.get(column, "")
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
-def _stem_matches_suffix_tokens(stem: str, suffix_tokens: Sequence[str]) -> bool:
-    """Return whether `stem` ends with any configured suffix token."""
-    normalized_stem = stem.casefold()
-    return any(normalized_stem.endswith(token.casefold()) for token in suffix_tokens)
+def _first_manifest_cell(row: CSVRow, columns: Sequence[str]) -> str:
+    """Return the first non-empty value across candidate manifest columns."""
+    for column in columns:
+        value = _manifest_cell(row, column)
+        if value:
+            return value
+    return ""
 
 
-def normalize_match_stem(
-    stem: str,
-    suffix_tokens: Sequence[str] = DEFAULT_MATCH_SUFFIX_TOKENS,
-) -> str:
-    """Normalize a filename stem for GT/prediction pairing.
+def _resolve_recorded_path(raw_path: str, *, base_dir: Path) -> Path:
+    """Resolve a path that was explicitly recorded in a manifest row."""
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (base_dir / candidate).resolve()
 
-    This strips configurable terminal suffix tokens such as `_mask`,
-    `_image`, or `_prediction` so slightly different GT and prediction
-    filenames can still match.
 
-    If your files diverge in some other systematic way, customize
-    `DEFAULT_MATCH_SUFFIX_TOKENS` above or pass `match_suffix_tokens=...`
-    into `evaluate_monusac_models(...)`.
+def _remove_relative_suffix(source_path: Path, relative_path: Path) -> Path:
+    """Strip a recorded relative path suffix from an absolute source path."""
+    source_parts = source_path.parts
+    relative_parts = relative_path.parts
+
+    if not relative_parts:
+        raise ValueError("Relative path is empty.")
+    if len(relative_parts) > len(source_parts):
+        raise ValueError(
+            f"Source path {source_path} is shorter than relative path {relative_path}."
+        )
+    if source_parts[-len(relative_parts) :] != relative_parts:
+        raise ValueError(
+            f"Source path {source_path} does not end with relative path {relative_path}."
+        )
+
+    root_parts = source_parts[: -len(relative_parts)]
+    if not root_parts:
+        raise ValueError(
+            f"Could not derive an input root from source path {source_path}."
+        )
+    return Path(*root_parts)
+
+
+def _derive_input_root_from_manifest_row(
+    row: CSVRow,
+    *,
+    manifest_path: Path,
+    row_number: int,
+) -> Path:
+    """Recover the tiled input root from paths already stored in `predictions.csv`.
+
+    The inference pipeline records both:
+    - `source_image_path`: the concrete input tile consumed by inference
+    - `relative_image_path` or propagated `image_path`: the same tile path
+      relative to the tiling root
+
+    When `mask_path` is relative, the evaluator does not guess a MoNuSAC root.
+    It removes the recorded relative image path from the recorded source image
+    path and uses that derived input root to resolve the GT mask path.
     """
-    normalized = stem.casefold().strip()
-    cleaned_tokens = tuple(
-        token.casefold().strip()
-        for token in suffix_tokens
-        if token and token.strip()
-    )
-
-    stripped = True
-    while stripped:
-        stripped = False
-        for token in cleaned_tokens:
-            if normalized.endswith(token):
-                normalized = normalized[: -len(token)].rstrip("._- ")
-                stripped = True
-                break
-
-    return normalized or stem.casefold()
-
-
-def _build_match_key(patient_id: str, relative_path: Path, normalized_stem: str) -> str:
-    """Build a stable match key within one patient subtree."""
-    parent = relative_path.parent.as_posix()
-    parts = [patient_id]
-    if parent != ".":
-        parts.append(parent.casefold())
-    parts.append(normalized_stem)
-    return "/".join(parts)
-
-
-def _record_display_relative_path(record: MaskFileRecord) -> str:
-    """Return a patient-aware relative path for CSV reporting."""
-    return (Path(record.patient_id) / record.relative_path).as_posix()
-
-
-def _discover_mask_records(
-    dataset_dir: Path,
-    *,
-    leaf_dir_name: str,
-    required_stem_suffix_tokens: Sequence[str] | None,
-    match_suffix_tokens: Sequence[str],
-) -> list[MaskFileRecord]:
-    """Discover mask files beneath patient directories and assign match keys."""
-    patient_leaf_dirs = _iter_patient_leaf_dirs(dataset_dir, leaf_dir_name)
-    if not patient_leaf_dirs:
-        raise FileNotFoundError(
-            "No patient directories containing the expected leaf directory were found. "
-            f"dataset_dir={dataset_dir}, leaf_dir_name={leaf_dir_name!r}"
+    source_image_path_text = _manifest_cell(row, "source_image_path")
+    if not source_image_path_text:
+        raise ValueError(
+            f"Row {row_number} in {manifest_path} has a relative `mask_path` but no "
+            "`source_image_path`. The evaluator needs that recorded input tile path "
+            "to resolve the GT mask without hardcoded roots."
         )
 
-    records: list[MaskFileRecord] = []
-    all_candidate_names: list[str] = []
-
-    for patient_id, leaf_dir in patient_leaf_dirs:
-        candidate_paths = [
-            path
-            for path in sorted(leaf_dir.rglob("*"))
-            if _is_supported_mask_file(path)
-        ]
-        all_candidate_names.extend(path.name for path in candidate_paths[:5])
-
-        if required_stem_suffix_tokens is None:
-            selected_paths = candidate_paths
-        else:
-            selected_paths = [
-                path
-                for path in candidate_paths
-                if _stem_matches_suffix_tokens(path.stem, required_stem_suffix_tokens)
-            ]
-
-        for path in selected_paths:
-            relative_path = path.relative_to(leaf_dir)
-            normalized_stem = normalize_match_stem(
-                path.stem,
-                suffix_tokens=match_suffix_tokens,
-            )
-            records.append(
-                MaskFileRecord(
-                    path=path,
-                    patient_id=patient_id,
-                    relative_path=relative_path,
-                    stem=path.stem,
-                    normalized_stem=normalized_stem,
-                    match_key=_build_match_key(
-                        patient_id=patient_id,
-                        relative_path=relative_path,
-                        normalized_stem=normalized_stem,
-                    ),
-                )
-            )
-
-    if records:
-        return records
-
-    token_text = (
-        ", ".join(required_stem_suffix_tokens)
-        if required_stem_suffix_tokens is not None
-        else "<none>"
-    )
-    sample_names = ", ".join(all_candidate_names[:10]) or "<no supported image files found>"
-    raise FileNotFoundError(
-        "No mask files matched the discovery rules. "
-        f"dataset_dir={dataset_dir}, leaf_dir_name={leaf_dir_name!r}, "
-        f"required_stem_suffix_tokens={token_text}. "
-        f"Sample candidate filenames: {sample_names}"
-    )
-
-
-def discover_ground_truth_masks(
-    gt_root: str | Path,
-    *,
-    dataset_folder: str = DEFAULT_DATASET_FOLDER,
-    leaf_dir_name: str = DEFAULT_GT_LEAF_DIR_NAME,
-    gt_mask_suffix_tokens: Sequence[str] = DEFAULT_GT_MASK_SUFFIX_TOKENS,
-    match_suffix_tokens: Sequence[str] = DEFAULT_MATCH_SUFFIX_TOKENS,
-) -> list[MaskFileRecord]:
-    """Discover GT mask files beneath `.../<dataset_folder>/<patient>/png_files`."""
-    dataset_dir = _resolve_dataset_dir(gt_root, dataset_folder)
-    return _discover_mask_records(
-        dataset_dir,
-        leaf_dir_name=leaf_dir_name,
-        required_stem_suffix_tokens=gt_mask_suffix_tokens,
-        match_suffix_tokens=match_suffix_tokens,
-    )
-
-
-def discover_prediction_masks(
-    model_dir: str | Path,
-    *,
-    dataset_folder: str = DEFAULT_DATASET_FOLDER,
-    leaf_dir_name: str = DEFAULT_PRED_LEAF_DIR_NAME,
-    match_suffix_tokens: Sequence[str] = DEFAULT_MATCH_SUFFIX_TOKENS,
-) -> list[MaskFileRecord]:
-    """Discover prediction mask files beneath one model directory."""
-    dataset_dir = _resolve_dataset_dir(model_dir, dataset_folder)
-    return _discover_mask_records(
-        dataset_dir,
-        leaf_dir_name=leaf_dir_name,
-        required_stem_suffix_tokens=None,
-        match_suffix_tokens=match_suffix_tokens,
-    )
-
-
-def _index_records_by_match_key(
-    records: Sequence[MaskFileRecord],
-) -> tuple[dict[str, MaskFileRecord], dict[str, list[MaskFileRecord]]]:
-    """Index discovered mask records by normalized match key and capture duplicates."""
-    records_by_key: dict[str, MaskFileRecord] = {}
-    duplicate_records_by_key: dict[str, list[MaskFileRecord]] = {}
-
-    for record in records:
-        if record.match_key in duplicate_records_by_key:
-            duplicate_records_by_key[record.match_key].append(record)
-            continue
-
-        if record.match_key in records_by_key:
-            duplicate_records_by_key[record.match_key] = [
-                records_by_key.pop(record.match_key),
-                record,
-            ]
-            continue
-
-        records_by_key[record.match_key] = record
-
-    return records_by_key, duplicate_records_by_key
-
-
-def _duplicate_match_key_rows(
-    duplicate_records_by_key: dict[str, list[MaskFileRecord]],
-    *,
-    model_name: str,
-    is_gt: bool,
-) -> list[CSVRow]:
-    """Create CSV rows describing duplicate normalized match keys."""
-    rows: list[CSVRow] = []
-    status = "duplicate_ground_truth" if is_gt else "duplicate_prediction"
-    side = "ground-truth" if is_gt else "prediction"
-
-    for match_key, duplicate_records in sorted(duplicate_records_by_key.items()):
-        first_record = duplicate_records[0]
-        relative_paths = " | ".join(
-            _record_display_relative_path(record) for record in duplicate_records
-        )
-        file_names = " | ".join(record.path.name for record in duplicate_records)
-        row = _empty_csv_row(
-            image_id=match_key,
-            model_name=model_name,
-            patient_id=first_record.patient_id,
-            relative_mask_path=_record_display_relative_path(first_record),
-            match_key=match_key,
-            status=status,
-            error_message=(
-                f"Multiple {side} files normalized to the same match key. "
-                "Adjust filename normalization or rename files to make the pairing unique."
-            ),
+    relative_image_path_text = _first_manifest_cell(row, RELATIVE_IMAGE_PATH_COLUMNS)
+    if not relative_image_path_text:
+        candidate_text = ", ".join(f"`{column}`" for column in RELATIVE_IMAGE_PATH_COLUMNS)
+        raise ValueError(
+            f"Row {row_number} in {manifest_path} has a relative `mask_path` but no "
+            f"{candidate_text}. The evaluator needs the recorded tile-relative path "
+            "from `predictions.csv` instead of reconstructing it manually."
         )
 
-        path_text = " | ".join(str(record.path) for record in duplicate_records)
-        if is_gt:
-            row["gt_path"] = path_text
-            row["gt_relative_path"] = relative_paths
-            row["gt_file_name"] = file_names
-        else:
-            row["pred_path"] = path_text
-            row["pred_relative_path"] = relative_paths
-            row["pred_file_name"] = file_names
-
-        rows.append(row)
-
-    return rows
-
-
-def _build_missing_row(
-    *,
-    model_name: str,
-    record: MaskFileRecord,
-    missing_prediction: bool,
-) -> CSVRow:
-    """Create a row for an unmatched GT or prediction mask."""
-    relative_path = _record_display_relative_path(record)
-    if missing_prediction:
-        return _empty_csv_row(
-            image_id=record.match_key,
-            model_name=model_name,
-            patient_id=record.patient_id,
-            relative_mask_path=relative_path,
-            match_key=record.match_key,
-            status="missing_prediction",
-            error_message=(
-                "No prediction mask matched this ground-truth mask after path and stem normalization."
-            ),
-            gt_path=record.path,
-            gt_relative_path=relative_path,
-            gt_file_name=record.path.name,
+    source_image_path = _resolve_recorded_path(
+        source_image_path_text,
+        base_dir=manifest_path.parent,
+    )
+    relative_image_path = Path(relative_image_path_text)
+    if relative_image_path.is_absolute():
+        raise ValueError(
+            f"Row {row_number} in {manifest_path} has an absolute relative image path "
+            f"column value: {relative_image_path}"
         )
 
-    return _empty_csv_row(
-        image_id=record.match_key,
-        model_name=model_name,
-        patient_id=record.patient_id,
-        relative_mask_path=relative_path,
-        match_key=record.match_key,
-        status="missing_ground_truth",
-        error_message=(
-            "No ground-truth mask matched this prediction mask after path and stem normalization."
-        ),
-        pred_path=record.path,
-        pred_relative_path=relative_path,
-        pred_file_name=record.path.name,
+    return _remove_relative_suffix(source_image_path, relative_image_path)
+
+
+def _resolve_ground_truth_mask_path_from_manifest_row(
+    row: CSVRow,
+    *,
+    manifest_path: Path,
+    row_number: int,
+) -> Path:
+    """Resolve the GT mask path recorded in `predictions.csv`.
+
+    `mask_path` comes from the original tile manifest. If it is absolute, it is
+    used directly. If it is relative, it is resolved against the tiled input
+    root derived from other path fields already present in the same CSV row.
+    """
+    gt_mask_path_text = _manifest_cell(row, "mask_path")
+    if not gt_mask_path_text:
+        raise ValueError(
+            f"Row {row_number} in {manifest_path} has an empty `mask_path` value."
+        )
+
+    gt_mask_path = Path(gt_mask_path_text).expanduser()
+    if gt_mask_path.is_absolute():
+        return gt_mask_path.resolve()
+
+    input_root = _derive_input_root_from_manifest_row(
+        row,
+        manifest_path=manifest_path,
+        row_number=row_number,
     )
+    return (input_root / gt_mask_path).resolve()
+
+
+def _resolve_predicted_mask_path_from_manifest_row(
+    row: CSVRow,
+    *,
+    manifest_path: Path,
+    row_number: int,
+) -> Path:
+    """Resolve the predicted mask path recorded in `predictions.csv`."""
+    pred_mask_path_text = _manifest_cell(row, "predicted_mask_path")
+    if not pred_mask_path_text:
+        raise ValueError(
+            f"Row {row_number} in {manifest_path} has an empty `predicted_mask_path` value."
+        )
+    return _resolve_recorded_path(pred_mask_path_text, base_dir=manifest_path.parent)
+
+
+def _manifest_row_image_id(row: CSVRow, *, row_number: int) -> str:
+    """Choose a stable row identifier for evaluation outputs."""
+    return _first_manifest_cell(row, ROW_ID_COLUMNS) or f"row_{row_number}"
+
+
+def _manifest_row_patient_id(row: CSVRow) -> str:
+    """Return the best available patient identifier from the manifest."""
+    return _first_manifest_cell(row, PATIENT_ID_COLUMNS)
 
 
 def _summarize_model_rows(
     rows: Sequence[CSVRow],
     *,
     model_name: str,
+    manifest_path: Path,
     output_csv: Path,
 ) -> ModelEvaluationSummary:
     """Aggregate row statuses into a per-model processing summary."""
     status_counts = Counter(str(row["status"]) for row in rows)
-    matched_pair_count = sum(
-        1 for row in rows if row["status"] in {"ok", "error"}
-    )
     return ModelEvaluationSummary(
         model_name=model_name,
-        matched_pair_count=matched_pair_count,
+        manifest_row_count=len(rows),
         ok_count=int(status_counts.get("ok", 0)),
         error_count=int(status_counts.get("error", 0)),
-        missing_prediction_count=int(status_counts.get("missing_prediction", 0)),
-        missing_ground_truth_count=int(status_counts.get("missing_ground_truth", 0)),
-        duplicate_gt_count=int(status_counts.get("duplicate_ground_truth", 0)),
-        duplicate_prediction_count=int(status_counts.get("duplicate_prediction", 0)),
+        manifest_path=manifest_path,
         output_csv=output_csv,
     )
 
@@ -1387,105 +1223,78 @@ def _summarize_model_rows(
 def _print_model_processing_summary(summary: ModelEvaluationSummary) -> None:
     """Print a concise processing summary for one model."""
     print(f"\n=== Model: {summary.model_name} ===")
-    print(f"Matched GT/prediction pairs: {summary.matched_pair_count}")
+    print(f"Manifest rows evaluated: {summary.manifest_row_count}")
     print(f"Successful evaluations: {summary.ok_count}")
     print(f"Evaluation errors: {summary.error_count}")
-    print(f"Missing predictions: {summary.missing_prediction_count}")
-    print(f"Missing GT masks: {summary.missing_ground_truth_count}")
-    print(f"Duplicate GT keys: {summary.duplicate_gt_count}")
-    print(f"Duplicate prediction keys: {summary.duplicate_prediction_count}")
+    print(f"Manifest: {summary.manifest_path}")
     print(f"CSV saved to: {summary.output_csv}")
 
 
-def _evaluate_model_records(
+def _evaluate_model_manifest(
     *,
     model_name: str,
-    gt_records_by_key: dict[str, MaskFileRecord],
-    gt_duplicate_records_by_key: dict[str, list[MaskFileRecord]],
-    pred_records: Sequence[MaskFileRecord],
+    manifest_path: Path,
     threshold: float,
     output_csv: Path,
 ) -> tuple[list[CSVRow], ModelEvaluationSummary]:
-    """Evaluate one model's predictions against a pre-discovered GT index."""
-    pred_records_by_key, pred_duplicate_records_by_key = _index_records_by_match_key(
-        pred_records
-    )
-
-    matched_keys = sorted(gt_records_by_key.keys() & pred_records_by_key.keys())
-    gt_only_keys = sorted(gt_records_by_key.keys() - pred_records_by_key.keys())
-    pred_only_keys = sorted(pred_records_by_key.keys() - gt_records_by_key.keys())
+    """Evaluate one model using the paths already recorded in `predictions.csv`."""
+    manifest_rows, fieldnames = _read_predictions_manifest(manifest_path)
+    _validate_predictions_manifest_columns(manifest_path, fieldnames)
 
     rows: list[CSVRow] = []
-    rows.extend(
-        _duplicate_match_key_rows(
-            gt_duplicate_records_by_key,
-            model_name=model_name,
-            is_gt=True,
+    for row_number, manifest_row in enumerate(manifest_rows, start=2):
+        image_id = _manifest_row_image_id(manifest_row, row_number=row_number)
+        patient_id = _manifest_row_patient_id(manifest_row)
+        gt_relative_path = _manifest_cell(manifest_row, "mask_path")
+        pred_relative_path = _first_manifest_cell(
+            manifest_row,
+            ("predicted_mask_relative_path",),
         )
-    )
-    rows.extend(
-        _duplicate_match_key_rows(
-            pred_duplicate_records_by_key,
-            model_name=model_name,
-            is_gt=False,
-        )
-    )
-
-    for match_key in matched_keys:
-        gt_record = gt_records_by_key[match_key]
-        pred_record = pred_records_by_key[match_key]
-        gt_relative_path = _record_display_relative_path(gt_record)
-        pred_relative_path = _record_display_relative_path(pred_record)
         row = _empty_csv_row(
-            image_id=match_key,
+            image_id=image_id,
             model_name=model_name,
-            patient_id=gt_record.patient_id,
-            relative_mask_path=gt_relative_path,
-            match_key=match_key,
+            patient_id=patient_id,
+            relative_mask_path=gt_relative_path or pred_relative_path,
+            match_key=image_id,
             status="ok",
-            gt_path=gt_record.path,
-            pred_path=pred_record.path,
             gt_relative_path=gt_relative_path,
             pred_relative_path=pred_relative_path,
-            gt_file_name=gt_record.path.name,
-            pred_file_name=pred_record.path.name,
         )
 
         try:
+            gt_path = _resolve_ground_truth_mask_path_from_manifest_row(
+                manifest_row,
+                manifest_path=manifest_path,
+                row_number=row_number,
+            )
+            pred_path = _resolve_predicted_mask_path_from_manifest_row(
+                manifest_row,
+                manifest_path=manifest_path,
+                row_number=row_number,
+            )
+
+            row["gt_path"] = str(gt_path)
+            row["pred_path"] = str(pred_path)
+            row["gt_file_name"] = gt_path.name
+            row["pred_file_name"] = pred_path.name
+
             result = evaluate_segmentation_files(
-                str(gt_record.path),
-                str(pred_record.path),
+                str(gt_path),
+                str(pred_path),
                 threshold=threshold,
             )
-            row.update(flatten_metrics_for_csv(result, image_id=match_key))
+            row.update(flatten_metrics_for_csv(result, image_id=image_id))
         except Exception as exc:
             row["status"] = "error"
-            row["error_message"] = str(exc)
+            row["error_message"] = f"Row {row_number}: {exc}"
 
         rows.append(row)
-
-    for match_key in gt_only_keys:
-        rows.append(
-            _build_missing_row(
-                model_name=model_name,
-                record=gt_records_by_key[match_key],
-                missing_prediction=True,
-            )
-        )
-
-    for match_key in pred_only_keys:
-        rows.append(
-            _build_missing_row(
-                model_name=model_name,
-                record=pred_records_by_key[match_key],
-                missing_prediction=False,
-            )
-        )
 
     _write_rows_to_csv(rows, output_csv)
     summary = _summarize_model_rows(
         rows,
         model_name=model_name,
+        manifest_path=manifest_path,
         output_csv=output_csv,
     )
     _print_model_processing_summary(summary)
@@ -1528,36 +1337,30 @@ def _discover_model_directories(
 
 def evaluate_monusac_models(
     *,
-    gt_root: str | Path | None = None,
     prediction_root: str | Path | None = None,
     output_dir: str | Path | None = None,
-    dataset_folder: str = DEFAULT_DATASET_FOLDER,
-    gt_leaf_dir_name: str = DEFAULT_GT_LEAF_DIR_NAME,
-    pred_leaf_dir_name: str = DEFAULT_PRED_LEAF_DIR_NAME,
     model_names: Sequence[str] | None = None,
-    gt_mask_suffix_tokens: Sequence[str] = DEFAULT_GT_MASK_SUFFIX_TOKENS,
-    match_suffix_tokens: Sequence[str] = DEFAULT_MATCH_SUFFIX_TOKENS,
     threshold: float = 0.5,
     save_combined_csv: bool = False,
     combined_csv_name: str = "all_models_evaluation.csv",
 ) -> tuple[dict[str, list[CSVRow]], list[ModelEvaluationSummary]]:
-    """Batch-evaluate one or more model directories against patched MoNuSAC GT masks.
+    """Batch-evaluate one or more model directories from their `predictions.csv`.
 
-    Expected default layout
-    -----------------------
-    Ground truth:
-    `data/Monusac/rescaled/patched/all_merged/<patient_info>/png_files`
+    Path resolution contract
+    ------------------------
+    - `predictions.csv` is the single source of truth for all GT and prediction
+      paths.
+    - `predicted_mask_path` is read directly from the manifest.
+    - `mask_path` is read directly from the manifest; if it is relative, it is
+      resolved using `source_image_path` plus `relative_image_path`/`image_path`
+      from the same row rather than from hardcoded dataset roots.
 
-    Predictions:
-    `inference/benchmarking/monusac/<model_name>/all_merged/<patient_info>/predicted_mask`
-
-    Parameters can be overridden when the directory names differ locally.
+    Output location
+    ---------------
+    - By default, per-model CSVs are written to
+      `inference/benchmarking/monusac/_evaluation/`.
+    - Pass `output_dir=...` or CLI `--output-dir` to write somewhere else.
     """
-    resolved_gt_root = (
-        Path(gt_root).expanduser().resolve()
-        if gt_root is not None
-        else _default_gt_root()
-    )
     resolved_prediction_root = (
         Path(prediction_root).expanduser().resolve()
         if prediction_root is not None
@@ -1569,17 +1372,6 @@ def evaluate_monusac_models(
         else _default_output_dir(resolved_prediction_root)
     )
 
-    gt_records = discover_ground_truth_masks(
-        resolved_gt_root,
-        dataset_folder=dataset_folder,
-        leaf_dir_name=gt_leaf_dir_name,
-        gt_mask_suffix_tokens=gt_mask_suffix_tokens,
-        match_suffix_tokens=match_suffix_tokens,
-    )
-    gt_records_by_key, gt_duplicate_records_by_key = _index_records_by_match_key(
-        gt_records
-    )
-
     model_results: dict[str, list[CSVRow]] = {}
     summaries: list[ModelEvaluationSummary] = []
     combined_rows: list[CSVRow] = []
@@ -1588,18 +1380,11 @@ def evaluate_monusac_models(
         resolved_prediction_root,
         model_names,
     ):
-        pred_records = discover_prediction_masks(
-            model_dir,
-            dataset_folder=dataset_folder,
-            leaf_dir_name=pred_leaf_dir_name,
-            match_suffix_tokens=match_suffix_tokens,
-        )
+        manifest_path = model_dir / DEFAULT_PREDICTIONS_MANIFEST_NAME
         model_output_csv = resolved_output_dir / f"{model_name}_evaluation.csv"
-        rows, summary = _evaluate_model_records(
+        rows, summary = _evaluate_model_manifest(
             model_name=model_name,
-            gt_records_by_key=gt_records_by_key,
-            gt_duplicate_records_by_key=gt_duplicate_records_by_key,
-            pred_records=pred_records,
+            manifest_path=manifest_path,
             threshold=threshold,
             output_csv=model_output_csv,
         )
@@ -1616,46 +1401,35 @@ def evaluate_monusac_models(
 
 
 def _parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for project-structure-aware MoNuSAC evaluation."""
+    """Parse CLI arguments for manifest-driven MoNuSAC evaluation."""
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate MoNuSAC GT masks against one or more model prediction "
-            "directories and save per-model CSV reports."
+            "Evaluate MoNuSAC predictions using the paths recorded in each "
+            "model directory's predictions.csv manifest."
         )
     )
-    parser.add_argument("--gt-root", type=Path, default=_default_gt_root())
     parser.add_argument(
         "--prediction-root",
         "--pred-root",
         dest="prediction_root",
         type=Path,
         default=_default_prediction_root(),
+        help=(
+            "Root directory containing per-model inference folders with "
+            f"`{DEFAULT_PREDICTIONS_MANIFEST_NAME}` files. "
+            "Defaults to the repo's MoNuSAC inference root."
+        ),
     )
-    parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--dataset-folder", default=DEFAULT_DATASET_FOLDER)
-    parser.add_argument("--gt-leaf-dir", default=DEFAULT_GT_LEAF_DIR_NAME)
-    parser.add_argument("--pred-leaf-dir", default=DEFAULT_PRED_LEAF_DIR_NAME)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for evaluation CSV outputs. Defaults to "
+            "<prediction-root>/_evaluation."
+        ),
+    )
     parser.add_argument("--model-names", nargs="+", default=None)
-    parser.add_argument(
-        "--gt-mask-suffix-token",
-        dest="gt_mask_suffix_tokens",
-        action="append",
-        default=None,
-        help=(
-            "Suffix token used to recognize GT mask files inside the GT leaf directory. "
-            "Repeat the flag to allow multiple endings."
-        ),
-    )
-    parser.add_argument(
-        "--match-suffix-token",
-        dest="match_suffix_tokens",
-        action="append",
-        default=None,
-        help=(
-            "Extra filename suffix token to strip before GT/prediction matching. "
-            "Repeat to add more normalization rules."
-        ),
-    )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--save-combined-csv", action="store_true")
     parser.add_argument("--combined-csv-name", default="all_models_evaluation.csv")
@@ -1695,25 +1469,13 @@ def _synthetic_example() -> tuple[IntArray, IntArray]:
 
 
 def main() -> None:
-    """Run the project-structure-aware batch evaluator from the command line."""
+    """Run the manifest-driven batch evaluator from the command line."""
     args = _parse_args()
-    gt_mask_suffix_tokens = tuple(
-        args.gt_mask_suffix_tokens or DEFAULT_GT_MASK_SUFFIX_TOKENS
-    )
-    match_suffix_tokens = tuple(
-        (*DEFAULT_MATCH_SUFFIX_TOKENS, *(args.match_suffix_tokens or ()))
-    )
 
     evaluate_monusac_models(
-        gt_root=args.gt_root,
         prediction_root=args.prediction_root,
         output_dir=args.output_dir,
-        dataset_folder=args.dataset_folder,
-        gt_leaf_dir_name=args.gt_leaf_dir,
-        pred_leaf_dir_name=args.pred_leaf_dir,
         model_names=args.model_names,
-        gt_mask_suffix_tokens=gt_mask_suffix_tokens,
-        match_suffix_tokens=match_suffix_tokens,
         threshold=args.threshold,
         save_combined_csv=bool(args.save_combined_csv),
         combined_csv_name=args.combined_csv_name,
