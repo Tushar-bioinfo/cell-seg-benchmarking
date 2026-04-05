@@ -15,14 +15,16 @@ Design notes
 - Instance IDs do not need to match numerically between GT and predictions.
 - One-to-one instance matching is performed globally with the Hungarian algorithm.
 - Assigned pairs below the IoU threshold are discarded.
+- Single-mask file loading is supported for PNG and TIFF inputs.
 
-This module intentionally does not include file loading, folder traversal,
-or CSV export. It focuses only on in-memory evaluation logic.
+This module intentionally does not include folder traversal or CSV export.
 """
 
+from pathlib import Path
 from pprint import pprint
 from typing import Any, TypedDict
 
+import imageio.v3 as iio
 import numpy as np
 import numpy.typing as npt
 from scipy.optimize import linear_sum_assignment
@@ -100,6 +102,56 @@ def _as_2d_array(mask: ArrayLike, name: str) -> npt.NDArray[Any]:
     return array
 
 
+def _safely_reduce_loaded_mask(array: npt.NDArray[Any], path: Path) -> npt.NDArray[Any]:
+    """Return a 2D mask array from a loaded image when reduction is unambiguous."""
+    if array.ndim == 2:
+        return array
+
+    if array.ndim != 3:
+        raise ValueError(
+            "Mask file must decode to a 2D array. "
+            f"Loaded {path} with shape {array.shape}."
+        )
+
+    squeezed = np.squeeze(array)
+    if squeezed.ndim == 2:
+        return np.asarray(squeezed)
+
+    if array.shape[-1] in (3, 4):
+        rgb = array[..., :3]
+        if np.array_equal(rgb[..., 0], rgb[..., 1]) and np.array_equal(
+            rgb[..., 0], rgb[..., 2]
+        ):
+            if array.shape[-1] == 4:
+                alpha_channel = array[..., 3]
+                if not np.all(alpha_channel == alpha_channel.flat[0]):
+                    raise ValueError(
+                        "Mask file has an RGBA layout with a non-constant alpha channel, "
+                        f"which is ambiguous for label masks: {path}"
+                    )
+            return np.asarray(rgb[..., 0])
+
+    if array.shape[0] in (3, 4):
+        rgb = array[:3, ...]
+        if np.array_equal(rgb[0, ...], rgb[1, ...]) and np.array_equal(
+            rgb[0, ...], rgb[2, ...]
+        ):
+            if array.shape[0] == 4:
+                alpha_channel = array[3, ...]
+                if not np.all(alpha_channel == alpha_channel.flat[0]):
+                    raise ValueError(
+                        "Mask file has a channel-first RGBA layout with a non-constant "
+                        f"alpha channel, which is ambiguous for label masks: {path}"
+                    )
+            return np.asarray(rgb[0, ...])
+
+    raise ValueError(
+        "Mask file must be 2D. Extra channels are only accepted when they are "
+        "singleton dimensions or replicated grayscale channels. "
+        f"Loaded {path} with shape {array.shape}."
+    )
+
+
 def _normalize_instance_mask(mask: ArrayLike, name: str) -> IntArray:
     """Return a validated 2D instance mask as `int64`.
 
@@ -150,6 +202,54 @@ def _validate_binary_mask(mask: ArrayLike, name: str) -> UInt8Array:
 def _sum_matched_pair_ious(matched_pairs: list[MatchedPair]) -> float:
     """Return the total IoU across all accepted instance matches."""
     return float(sum(pair["iou"] for pair in matched_pairs))
+
+
+def load_mask(path: str) -> npt.NDArray[Any]:
+    """Load one PNG or TIFF segmentation mask as a 2D NumPy array.
+
+    The loader preserves the on-disk numeric dtype whenever practical so integer
+    instance labels such as `uint16` survive the round trip. Ambiguous
+    multi-channel inputs are rejected with a clear error.
+
+    Parameters
+    ----------
+    path:
+        Filesystem path to a `.png`, `.tif`, or `.tiff` mask file.
+
+    Returns
+    -------
+    np.ndarray
+        A 2D mask array.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
+    ValueError
+        If the suffix is unsupported, the file cannot be interpreted as a 2D
+        mask, or the file contents are otherwise ambiguous for label masks.
+    """
+    mask_path = Path(path).expanduser()
+    if not mask_path.is_file():
+        raise FileNotFoundError(f"Mask file not found: {mask_path}")
+
+    suffix = mask_path.suffix.lower()
+    if suffix not in {".png", ".tif", ".tiff"}:
+        raise ValueError(
+            "Mask file must be a PNG or TIFF image, "
+            f"got '{suffix or '<no suffix>'}' for {mask_path}"
+        )
+
+    try:
+        loaded = iio.imread(mask_path)
+    except Exception as exc:  # pragma: no cover - depends on image backend/runtime.
+        raise ValueError(f"Failed to read mask file {mask_path}: {exc}") from exc
+
+    array = np.asarray(loaded)
+    if array.size == 0:
+        raise ValueError(f"Mask file is empty: {mask_path}")
+
+    return _safely_reduce_loaded_mask(array, mask_path)
 
 
 def validate_same_shape(mask1: ArrayLike, mask2: ArrayLike) -> None:
@@ -455,6 +555,48 @@ def evaluate_segmentation(
             threshold=threshold,
         ),
     }
+
+
+def evaluate_segmentation_files(
+    gt_path: str,
+    pred_path: str,
+    threshold: float = 0.5,
+) -> SegmentationEvaluation:
+    """Load two mask files and evaluate them with the standard segmentation API.
+
+    Parameters
+    ----------
+    gt_path:
+        Path to the ground-truth PNG or TIFF mask.
+    pred_path:
+        Path to the predicted PNG or TIFF mask.
+    threshold:
+        IoU threshold used for one-to-one instance matching.
+
+    Returns
+    -------
+    SegmentationEvaluation
+        The same nested result dictionary returned by `evaluate_segmentation`.
+
+    Examples
+    --------
+    PNG files:
+        `result = evaluate_segmentation_files("gt_mask.png", "pred_mask.png")`
+
+    TIFF files:
+        `result = evaluate_segmentation_files("gt_mask.tiff", "pred_mask.tif", threshold=0.5)`
+    """
+    gt_mask = load_mask(gt_path)
+    pred_mask = load_mask(pred_path)
+
+    try:
+        return evaluate_segmentation(gt_mask, pred_mask, threshold=threshold)
+    except ValueError as exc:
+        raise ValueError(
+            "Failed to evaluate segmentation files "
+            f"gt_path={Path(gt_path).expanduser()}, pred_path={Path(pred_path).expanduser()}: "
+            f"{exc}"
+        ) from exc
 
 
 def _synthetic_example() -> tuple[IntArray, IntArray]:
