@@ -16,3 +16,6 @@ inference/*
 !inference/.gitkeep
 
 pixis/*
+
+AGENTS.md
+
