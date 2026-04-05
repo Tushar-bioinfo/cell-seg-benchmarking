@@ -16,10 +16,11 @@ Design notes
 - One-to-one instance matching is performed globally with the Hungarian algorithm.
 - Assigned pairs below the IoU threshold are discarded.
 - Single-mask file loading is supported for PNG and TIFF inputs.
-
-This module intentionally does not include folder traversal or CSV export.
+- Folder-level batch evaluation and CSV export are supported for simple
+  filename-stem based mask pairing.
 """
 
+import csv
 from pathlib import Path
 from pprint import pprint
 from typing import Any, TypedDict
@@ -92,6 +93,38 @@ IntArray = npt.NDArray[np.int64]
 UInt8Array = npt.NDArray[np.uint8]
 FloatArray = npt.NDArray[np.float64]
 BoolArray = npt.NDArray[np.bool_]
+CSVRow = dict[str, Any]
+
+FLAT_METRIC_FIELDNAMES: tuple[str, ...] = (
+    "pixel_tp",
+    "pixel_tn",
+    "pixel_fp",
+    "pixel_fn",
+    "pixel_precision",
+    "pixel_recall",
+    "pixel_f1",
+    "pixel_dice",
+    "instance_tp",
+    "instance_fp",
+    "instance_fn",
+    "instance_object_precision",
+    "instance_object_recall",
+    "instance_rq",
+    "instance_sq",
+    "instance_pq",
+    "instance_match_count",
+    "instance_unmatched_gt_count",
+    "instance_unmatched_pred_count",
+)
+
+CSV_FIELDNAMES: tuple[str, ...] = (
+    "image_id",
+    "status",
+    "error_message",
+    "gt_path",
+    "pred_path",
+    *FLAT_METRIC_FIELDNAMES,
+)
 
 
 def _as_2d_array(mask: ArrayLike, name: str) -> npt.NDArray[Any]:
@@ -597,6 +630,302 @@ def evaluate_segmentation_files(
             f"gt_path={Path(gt_path).expanduser()}, pred_path={Path(pred_path).expanduser()}: "
             f"{exc}"
         ) from exc
+
+
+def flatten_metrics_for_csv(result: dict[str, Any], image_id: str) -> CSVRow:
+    """Flatten a nested segmentation result into one CSV-friendly row.
+
+    Parameters
+    ----------
+    result:
+        Nested segmentation result in the format returned by
+        `evaluate_segmentation(...)` or `evaluate_segmentation_files(...)`.
+    image_id:
+        Identifier to store alongside the flattened metrics, typically the
+        filename stem used to pair GT and prediction masks.
+
+    Returns
+    -------
+    dict[str, Any]
+        Flat mapping of scalar summary metrics from both the pixel-level and
+        instance-level results. Verbose list fields such as `matched_pairs` are
+        intentionally omitted.
+    """
+    pixel_metrics = result["pixel_metrics"]
+    instance_metrics = result["instance_metrics"]
+
+    return {
+        "image_id": image_id,
+        "pixel_tp": pixel_metrics["tp"],
+        "pixel_tn": pixel_metrics["tn"],
+        "pixel_fp": pixel_metrics["fp"],
+        "pixel_fn": pixel_metrics["fn"],
+        "pixel_precision": pixel_metrics["precision"],
+        "pixel_recall": pixel_metrics["recall"],
+        "pixel_f1": pixel_metrics["f1"],
+        "pixel_dice": pixel_metrics["dice"],
+        "instance_tp": instance_metrics["tp"],
+        "instance_fp": instance_metrics["fp"],
+        "instance_fn": instance_metrics["fn"],
+        "instance_object_precision": instance_metrics["object_precision"],
+        "instance_object_recall": instance_metrics["object_recall"],
+        "instance_rq": instance_metrics["rq"],
+        "instance_sq": instance_metrics["sq"],
+        "instance_pq": instance_metrics["pq"],
+        "instance_match_count": len(instance_metrics["matched_pairs"]),
+        "instance_unmatched_gt_count": len(instance_metrics["unmatched_gt_labels"]),
+        "instance_unmatched_pred_count": len(
+            instance_metrics["unmatched_pred_labels"]
+        ),
+    }
+
+
+def _empty_csv_row(
+    image_id: str,
+    *,
+    status: str,
+    error_message: str = "",
+    gt_path: Path | None = None,
+    pred_path: Path | None = None,
+) -> CSVRow:
+    """Create a CSV row shell with consistent columns across all statuses."""
+    row: CSVRow = {field: "" for field in CSV_FIELDNAMES}
+    row["image_id"] = image_id
+    row["status"] = status
+    row["error_message"] = error_message
+    row["gt_path"] = str(gt_path) if gt_path is not None else ""
+    row["pred_path"] = str(pred_path) if pred_path is not None else ""
+    return row
+
+
+def _find_mask_files(mask_dir: Path, pattern: str) -> tuple[dict[str, Path], dict[str, list[Path]]]:
+    """Index mask files under one directory by filename stem.
+
+    Notes
+    -----
+    - `pattern` is passed directly to `Path.glob(...)`
+    - use `"**/*.png"` if recursive matching is needed
+    - stems must be unique within a directory to avoid ambiguous pairing
+    """
+    files_by_stem: dict[str, Path] = {}
+    duplicate_paths_by_stem: dict[str, list[Path]] = {}
+
+    for path in sorted(mask_dir.glob(pattern)):
+        if not path.is_file():
+            continue
+
+        stem = path.stem
+        if stem in duplicate_paths_by_stem:
+            duplicate_paths_by_stem[stem].append(path)
+            continue
+
+        if stem in files_by_stem:
+            duplicate_paths_by_stem[stem] = [files_by_stem.pop(stem), path]
+            continue
+
+        files_by_stem[stem] = path
+
+    return files_by_stem, duplicate_paths_by_stem
+
+
+def _write_rows_to_csv(rows: list[CSVRow], output_csv: Path) -> None:
+    """Write evaluation rows to CSV using a stable column order."""
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in CSV_FIELDNAMES})
+
+
+def _print_evaluation_summary(
+    *,
+    matched_pair_count: int,
+    failure_count: int,
+    gt_only_stems: list[str],
+    pred_only_stems: list[str],
+) -> None:
+    """Print a concise summary for one folder-level evaluation run."""
+    print(f"Matched file pairs processed: {matched_pair_count}")
+    print(f"Failures: {failure_count}")
+    print(f"GT-only files: {len(gt_only_stems)}")
+    print(f"Prediction-only files: {len(pred_only_stems)}")
+
+    if gt_only_stems:
+        print("Unmatched GT stems:", ", ".join(gt_only_stems))
+
+    if pred_only_stems:
+        print("Unmatched prediction stems:", ", ".join(pred_only_stems))
+
+
+def _duplicate_stem_rows(
+    duplicate_paths_by_stem: dict[str, list[Path]],
+    *,
+    is_gt: bool,
+) -> list[CSVRow]:
+    """Create error rows for ambiguous duplicate stems within one folder."""
+    rows: list[CSVRow] = []
+    side = "ground-truth" if is_gt else "prediction"
+    path_field = "gt_path" if is_gt else "pred_path"
+
+    for image_id, paths in sorted(duplicate_paths_by_stem.items()):
+        row = _empty_csv_row(
+            image_id,
+            status="error",
+            error_message=(
+                f"Duplicate {side} files found for filename stem '{image_id}'. "
+                "Rename files so stems are unique before evaluation."
+            ),
+        )
+        row[path_field] = " | ".join(str(path) for path in paths)
+        rows.append(row)
+
+    return rows
+
+
+def evaluate_folder(
+    gt_dir: str,
+    pred_dir: str,
+    pattern: str = "*.png",
+    threshold: float = 0.5,
+    output_csv: str | None = None,
+) -> list[CSVRow]:
+    """Evaluate many GT/prediction mask pairs matched by filename stem.
+
+    Parameters
+    ----------
+    gt_dir:
+        Directory containing ground-truth mask files.
+    pred_dir:
+        Directory containing predicted mask files.
+    pattern:
+        Glob pattern passed to `Path.glob(...)` in each directory. The default
+        matches PNG files in the top level only. Use `"**/*.png"` for recursive
+        matching.
+    threshold:
+        IoU threshold used for one-to-one instance matching.
+    output_csv:
+        Optional path where the flattened evaluation rows should be saved.
+
+    Returns
+    -------
+    list[dict]
+        One row per matched pair or unmatched file. Successful rows contain
+        flattened metrics with `status="ok"`. Failed evaluations and unmatched
+        files receive an explanatory `status` and `error_message`.
+
+    Expected folder structure
+    -------------------------
+    ```text
+    gt_masks/
+      image_001.png
+      image_002.png
+      image_003.png
+
+    pred_masks/
+      image_001.png
+      image_002.png
+      image_004.png
+    ```
+
+    Example
+    -------
+    ```python
+    rows = evaluate_folder(
+        gt_dir="gt_masks",
+        pred_dir="pred_masks",
+        output_csv="results/monusac_eval.csv",
+    )
+    ```
+    """
+    gt_root = Path(gt_dir).expanduser()
+    pred_root = Path(pred_dir).expanduser()
+
+    if not gt_root.is_dir():
+        raise NotADirectoryError(f"Ground-truth directory not found: {gt_root}")
+    if not pred_root.is_dir():
+        raise NotADirectoryError(f"Prediction directory not found: {pred_root}")
+
+    gt_files, gt_duplicates = _find_mask_files(gt_root, pattern)
+    pred_files, pred_duplicates = _find_mask_files(pred_root, pattern)
+
+    gt_stems = set(gt_files)
+    pred_stems = set(pred_files)
+    gt_duplicate_stems = set(gt_duplicates)
+    pred_duplicate_stems = set(pred_duplicates)
+    matched_stems = sorted(gt_stems & pred_stems)
+    gt_only_stems = sorted((gt_stems - pred_stems) - pred_duplicate_stems)
+    pred_only_stems = sorted((pred_stems - gt_stems) - gt_duplicate_stems)
+
+    rows: list[CSVRow] = []
+    rows.extend(_duplicate_stem_rows(gt_duplicates, is_gt=True))
+    rows.extend(_duplicate_stem_rows(pred_duplicates, is_gt=False))
+    failure_count = len(rows)
+
+    for image_id in matched_stems:
+        gt_path = gt_files[image_id]
+        pred_path = pred_files[image_id]
+        row = _empty_csv_row(
+            image_id,
+            status="ok",
+            gt_path=gt_path,
+            pred_path=pred_path,
+        )
+
+        try:
+            result = evaluate_segmentation_files(
+                str(gt_path),
+                str(pred_path),
+                threshold=threshold,
+            )
+            row.update(flatten_metrics_for_csv(result, image_id=image_id))
+        except Exception as exc:
+            row["status"] = "error"
+            row["error_message"] = str(exc)
+            failure_count += 1
+
+        rows.append(row)
+
+    for image_id in gt_only_stems:
+        gt_path = gt_files[image_id]
+        rows.append(
+            _empty_csv_row(
+                image_id,
+                status="missing_prediction",
+                error_message=(
+                    f"No prediction mask matched GT filename stem '{image_id}'."
+                ),
+                gt_path=gt_path,
+            )
+        )
+
+    for image_id in pred_only_stems:
+        pred_path = pred_files[image_id]
+        rows.append(
+            _empty_csv_row(
+                image_id,
+                status="missing_ground_truth",
+                error_message=(
+                    f"No ground-truth mask matched prediction filename stem '{image_id}'."
+                ),
+                pred_path=pred_path,
+            )
+        )
+
+    if output_csv is not None:
+        output_path = Path(output_csv).expanduser()
+        _write_rows_to_csv(rows, output_path)
+        print(f"Saved CSV results to: {output_path}")
+
+    _print_evaluation_summary(
+        matched_pair_count=len(matched_stems),
+        failure_count=failure_count,
+        gt_only_stems=gt_only_stems,
+        pred_only_stems=pred_only_stems,
+    )
+
+    return rows
 
 
 def _synthetic_example() -> tuple[IntArray, IntArray]:
