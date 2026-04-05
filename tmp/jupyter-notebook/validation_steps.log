@@ -1,0 +1,13 @@
+repo_root=/Users/tusharsingh/Library/CloudStorage/Box-Box/internship-2026/cell-seg/bencharmking-v1
+installed imageio validation stub
+wrote source image and gt mask
+wrote synthetic model outputs
+loaded notebook with 9 code cells
+executed config cell
+executed discovery cell
+executed helper cell
+executed selection cell
+executed plotting cell
+selected rows shape=(1, 19)
+plot_results=1
+saved_path=/Users/tusharsingh/Library/CloudStorage/Box-Box/internship-2026/cell-seg/bencharmking-v1/tmp/jupyter-notebook/synthetic_eval/plots/row_0_patch_0001.png
