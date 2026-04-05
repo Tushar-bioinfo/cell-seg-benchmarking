@@ -5,6 +5,7 @@
 - `monusac_download_extract.ipynb`: Downloads `RationAI/MoNuSAC` from Hugging Face, merges `train` and `test`, and exports paired image and mask PNG files into `../../data/Monusac/`.
 - `monusac_annotation_qc.ipynb`: Loads exported MoNuSAC image/mask pairs, overlays the instance mask on the RGB patch, then rescales a 40x patch to 20x with a label-aware mask resize and shows the overlay again for QC.
 - `monusac_visualization_utils.py`: Shared helper functions for MoNuSAC sample lookup, overlay rendering, and 40x to 20x image/mask rescaling.
+- `monusac_tile_export.py`: Splits exported MoNuSAC image/mask pairs into fixed-size patches and writes both per-image `dataset.csv` files and global patch manifests.
 
 ## Pulling Latest Changes on HPC
 
@@ -60,6 +61,19 @@ For annotation QC after export, open:
 ```text
 scripts/benchmarking/monusac_annotation_qc.ipynb
 ```
+
+For fixed-size tiling after export, run:
+
+```bash
+pixi run python scripts/benchmarking/monusac_tile_export.py --patch-size 256
+```
+
+That writes a new output tree under `data/Monusac/tiles_256/` by default, with:
+
+- one folder per source `unique_id`
+- patch image/mask PNGs for each full `256x256` crop
+- `dataset.csv` inside each source-image folder
+- `all_patches_dataset.csv` and `image_patch_summary.csv` at the tiling root
 
 Important:
 

@@ -2,6 +2,15 @@
 .pixi/*
 !.pixi/config.toml
 
+# local machine metadata
+.DS_Store
+
+# local Codex context
+AGENTS.md
+docs/
+.codex/
+.agents/
+
 data/*
 !data/.gitkeep
 
