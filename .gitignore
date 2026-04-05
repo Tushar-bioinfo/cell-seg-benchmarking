@@ -6,8 +6,6 @@
 .DS_Store
 
 # local Codex context
-AGENTS.md
-docs/
 .codex/
 .agents/
 
