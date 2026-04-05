@@ -7,8 +7,8 @@ Mask-reading context from `scripts/benchmarking/monusac_pixel_confusion.py`:
 - arrays are treated as instance-labeled masks
 - label `0` is background
 
-This module provides pairwise IoU matrix construction and one-to-one instance
-matching. It does not implement PQ, RQ, or SQ yet.
+This module provides pairwise IoU matrix construction, one-to-one instance
+matching, and instance-level evaluation metrics such as RQ, SQ, and PQ.
 """
 
 import numpy as np
@@ -17,6 +17,7 @@ from scipy.optimize import linear_sum_assignment
 
 MatchPair = dict[str, int | float]
 MatchResult = dict[str, list[MatchPair] | list[int]]
+InstanceMetrics = dict[str, int | float | list[MatchPair] | list[int]]
 
 
 def extract_instance_labels(mask: np.ndarray) -> np.ndarray:
@@ -228,6 +229,100 @@ def match_instances(
     }
 
 
+def _safe_divide(numerator: float, denominator: float) -> float:
+    """Return `numerator / denominator`, or `0.0` when the denominator is zero."""
+    if denominator == 0:
+        return 0.0
+    return float(numerator / denominator)
+
+
+def _sum_matched_pair_ious(matched_pairs: list[MatchPair]) -> float:
+    """Return the sum of IoUs over all matched GT/prediction pairs."""
+    return float(sum(float(pair["iou"]) for pair in matched_pairs))
+
+
+def compute_instance_metrics(
+    gt_mask: np.ndarray,
+    pred_mask: np.ndarray,
+    threshold: float = 0.5,
+) -> InstanceMetrics:
+    """Compute instance-level detection and segmentation metrics from two masks.
+
+    Parameters
+    ----------
+    gt_mask:
+        Ground-truth instance mask where each non-zero integer denotes one object.
+    pred_mask:
+        Predicted instance mask where each non-zero integer denotes one object.
+    threshold:
+        Minimum IoU required for an assigned pair to count as a match.
+
+    Returns
+    -------
+    InstanceMetrics
+        Dictionary containing counts, object-level precision/recall, RQ, SQ, PQ,
+        matched pairs, and unmatched GT/predicted labels.
+
+    Raises
+    ------
+    ValueError
+        If the masks do not share the same shape, or if `threshold` is outside
+        `[0.0, 1.0]`.
+
+    Notes
+    -----
+    - SQ asks: among the objects that were matched correctly, how good was the
+      mask overlap on average?
+    - RQ asks: how well did the method find the right objects, penalizing both
+      misses and extra predictions?
+    - PQ combines both ideas into one score, so a method needs good detection
+      and good overlap quality to score well.
+    """
+    iou_matrix, gt_labels, pred_labels = compute_iou_matrix(gt_mask, pred_mask)
+    match_result = match_instances(
+        iou_matrix=iou_matrix,
+        gt_labels=gt_labels,
+        pred_labels=pred_labels,
+        threshold=threshold,
+    )
+
+    matched_pairs = list(match_result["matched_pairs"])
+    unmatched_gt_labels = list(match_result["unmatched_gt_labels"])
+    unmatched_pred_labels = list(match_result["unmatched_pred_labels"])
+
+    tp = len(matched_pairs)
+    fp = len(unmatched_pred_labels)
+    fn = len(unmatched_gt_labels)
+    matched_iou_sum = _sum_matched_pair_ious(matched_pairs)
+
+    object_precision = _safe_divide(tp, tp + fp)
+    object_recall = _safe_divide(tp, tp + fn)
+
+    # RQ measures instance detection quality after matching.
+    panoptic_denominator = tp + (0.5 * fp) + (0.5 * fn)
+    rq = _safe_divide(tp, panoptic_denominator)
+
+    # SQ measures the average overlap quality of only the matched objects.
+    sq = _safe_divide(matched_iou_sum, tp)
+
+    # PQ is the combined instance score: find the right objects and segment them well.
+    pq = _safe_divide(matched_iou_sum, panoptic_denominator)
+
+    return {
+        "tp": int(tp),
+        "fp": int(fp),
+        "fn": int(fn),
+        "object_precision": float(object_precision),
+        "object_recall": float(object_recall),
+        "rq": float(rq),
+        "sq": float(sq),
+        "pq": float(pq),
+        "matched_pairs": matched_pairs,
+        "unmatched_gt_labels": [int(label) for label in unmatched_gt_labels],
+        "unmatched_pred_labels": [int(label) for label in unmatched_pred_labels],
+    }
+
+
 def _assert_matching_result(
     actual_result: MatchResult,
     expected_pairs: list[MatchPair],
@@ -317,6 +412,65 @@ def _run_matching_test_from_matrix(
         expected_pairs=expected_pairs,
         expected_unmatched_gt=expected_unmatched_gt,
         expected_unmatched_pred=expected_unmatched_pred,
+    )
+
+
+def _assert_instance_metric_result(
+    actual_result: InstanceMetrics,
+    expected_result: InstanceMetrics,
+) -> None:
+    """Assert that the computed instance metrics match the expected values."""
+    assert actual_result["tp"] == expected_result["tp"]
+    assert actual_result["fp"] == expected_result["fp"]
+    assert actual_result["fn"] == expected_result["fn"]
+    assert np.isclose(actual_result["object_precision"], expected_result["object_precision"])
+    assert np.isclose(actual_result["object_recall"], expected_result["object_recall"])
+    assert np.isclose(actual_result["rq"], expected_result["rq"])
+    assert np.isclose(actual_result["sq"], expected_result["sq"])
+    assert np.isclose(actual_result["pq"], expected_result["pq"])
+
+    _assert_matching_result(
+        actual_result={
+            "matched_pairs": list(actual_result["matched_pairs"]),
+            "unmatched_gt_labels": list(actual_result["unmatched_gt_labels"]),
+            "unmatched_pred_labels": list(actual_result["unmatched_pred_labels"]),
+        },
+        expected_pairs=list(expected_result["matched_pairs"]),
+        expected_unmatched_gt=list(expected_result["unmatched_gt_labels"]),
+        expected_unmatched_pred=list(expected_result["unmatched_pred_labels"]),
+    )
+
+
+def _run_instance_metric_test(
+    name: str,
+    gt_mask: np.ndarray,
+    pred_mask: np.ndarray,
+    expected_result: InstanceMetrics,
+    threshold: float = 0.5,
+) -> None:
+    """Run one instance-metric test, print the result, and assert correctness."""
+    gt_labels = extract_instance_labels(gt_mask)
+    pred_labels = extract_instance_labels(pred_mask)
+    result = compute_instance_metrics(
+        gt_mask=gt_mask,
+        pred_mask=pred_mask,
+        threshold=threshold,
+    )
+
+    print(f"\n=== {name} ===")
+    print("number of GT objects:", len(gt_labels))
+    print("number of predicted objects:", len(pred_labels))
+    print("matched pairs:", result["matched_pairs"])
+    print("TP, FP, FN:", result["tp"], result["fp"], result["fn"])
+    print("object precision:", result["object_precision"])
+    print("object recall:", result["object_recall"])
+    print("RQ:", result["rq"])
+    print("SQ:", result["sq"])
+    print("PQ:", result["pq"])
+
+    _assert_instance_metric_result(
+        actual_result=result,
+        expected_result=expected_result,
     )
 
 
@@ -440,4 +594,151 @@ if __name__ == "__main__":
         expected_pairs=[],
         expected_unmatched_gt=[],
         expected_unmatched_pred=[10, 20],
+    )
+
+    background_only = np.zeros((2, 2), dtype=np.uint16)
+    gt_only = np.array(
+        [
+            [1, 1],
+            [0, 0],
+        ],
+        dtype=np.uint16,
+    )
+    pred_only = np.array(
+        [
+            [7, 7],
+            [0, 0],
+        ],
+        dtype=np.uint16,
+    )
+    two_object_gt = np.array(
+        [
+            [1, 1, 0, 2],
+            [1, 1, 0, 2],
+        ],
+        dtype=np.uint16,
+    )
+    two_object_pred = np.array(
+        [
+            [5, 5, 0, 6],
+            [5, 0, 0, 6],
+        ],
+        dtype=np.uint16,
+    )
+
+    _run_instance_metric_test(
+        name="8. metrics with background-only masks",
+        gt_mask=background_only,
+        pred_mask=background_only,
+        expected_result={
+            "tp": 0,
+            "fp": 0,
+            "fn": 0,
+            "object_precision": 0.0,
+            "object_recall": 0.0,
+            "rq": 0.0,
+            "sq": 0.0,
+            "pq": 0.0,
+            "matched_pairs": [],
+            "unmatched_gt_labels": [],
+            "unmatched_pred_labels": [],
+        },
+    )
+
+    _run_instance_metric_test(
+        name="9. metrics when GT has objects but prediction is empty",
+        gt_mask=gt_only,
+        pred_mask=background_only,
+        expected_result={
+            "tp": 0,
+            "fp": 0,
+            "fn": 1,
+            "object_precision": 0.0,
+            "object_recall": 0.0,
+            "rq": 0.0,
+            "sq": 0.0,
+            "pq": 0.0,
+            "matched_pairs": [],
+            "unmatched_gt_labels": [1],
+            "unmatched_pred_labels": [],
+        },
+    )
+
+    _run_instance_metric_test(
+        name="10. metrics when prediction has objects but GT is empty",
+        gt_mask=background_only,
+        pred_mask=pred_only,
+        expected_result={
+            "tp": 0,
+            "fp": 1,
+            "fn": 0,
+            "object_precision": 0.0,
+            "object_recall": 0.0,
+            "rq": 0.0,
+            "sq": 0.0,
+            "pq": 0.0,
+            "matched_pairs": [],
+            "unmatched_gt_labels": [],
+            "unmatched_pred_labels": [7],
+        },
+    )
+
+    _run_instance_metric_test(
+        name="11. metrics for one perfect instance match",
+        gt_mask=perfect_gt,
+        pred_mask=perfect_pred,
+        expected_result={
+            "tp": 1,
+            "fp": 0,
+            "fn": 0,
+            "object_precision": 1.0,
+            "object_recall": 1.0,
+            "rq": 1.0,
+            "sq": 1.0,
+            "pq": 1.0,
+            "matched_pairs": [{"gt_label": 1, "pred_label": 9, "iou": 1.0}],
+            "unmatched_gt_labels": [],
+            "unmatched_pred_labels": [],
+        },
+    )
+
+    _run_instance_metric_test(
+        name="12. metrics with one matched object and one extra prediction",
+        gt_mask=one_gt_two_pred_gt,
+        pred_mask=one_gt_two_pred_pred,
+        expected_result={
+            "tp": 1,
+            "fp": 1,
+            "fn": 0,
+            "object_precision": 0.5,
+            "object_recall": 1.0,
+            "rq": 2.0 / 3.0,
+            "sq": 0.5,
+            "pq": 1.0 / 3.0,
+            "matched_pairs": [{"gt_label": 1, "pred_label": 10, "iou": 0.5}],
+            "unmatched_gt_labels": [],
+            "unmatched_pred_labels": [20],
+        },
+    )
+
+    _run_instance_metric_test(
+        name="13. metrics with two matched objects and imperfect overlap",
+        gt_mask=two_object_gt,
+        pred_mask=two_object_pred,
+        expected_result={
+            "tp": 2,
+            "fp": 0,
+            "fn": 0,
+            "object_precision": 1.0,
+            "object_recall": 1.0,
+            "rq": 1.0,
+            "sq": 0.875,
+            "pq": 0.875,
+            "matched_pairs": [
+                {"gt_label": 1, "pred_label": 5, "iou": 0.75},
+                {"gt_label": 2, "pred_label": 6, "iou": 1.0},
+            ],
+            "unmatched_gt_labels": [],
+            "unmatched_pred_labels": [],
+        },
     )
