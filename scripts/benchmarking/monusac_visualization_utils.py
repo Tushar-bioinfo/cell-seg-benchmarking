@@ -13,6 +13,116 @@ DEFAULT_OVERLAY_ALPHA = 0.35
 DEFAULT_MIN_INSTANCE_FRACTION = 0.25
 
 
+def _resolve_user_path(path_like: str | Path, *, search_from: Path | None = None) -> Path:
+    raw_path = Path(path_like).expanduser()
+    if raw_path.is_absolute():
+        resolved = raw_path.resolve()
+        if resolved.exists():
+            return resolved
+        raise FileNotFoundError(f"Path does not exist: {resolved}")
+
+    bases: list[Path] = []
+    if search_from is not None:
+        search_path = Path(search_from).expanduser()
+        if search_path.exists():
+            resolved_search_path = search_path.resolve()
+            bases.append(
+                resolved_search_path if resolved_search_path.is_dir() else resolved_search_path.parent
+            )
+        else:
+            bases.append(search_path.resolve() if not search_path.suffix else search_path.parent.resolve())
+    bases.append(Path.cwd().resolve())
+
+    checked: set[Path] = set()
+    for base in bases:
+        candidate = (base / raw_path).resolve()
+        if candidate in checked:
+            continue
+        checked.add(candidate)
+        if candidate.exists():
+            return candidate
+
+    base = bases[0]
+    raise FileNotFoundError(
+        f"Could not resolve {path_like!r} relative to {base} or the current working directory."
+    )
+
+
+def sample_id_from_image_path(image_path: str | Path) -> str:
+    image_name = Path(image_path).name
+    if image_name.endswith(IMAGE_SUFFIX):
+        return image_name[: -len(IMAGE_SUFFIX)]
+    return Path(image_path).stem
+
+
+def infer_mask_path_from_image_path(
+    image_path: str | Path,
+    *,
+    mask_path: str | Path | None = None,
+    search_from: Path | None = None,
+) -> Path:
+    resolved_image_path = _resolve_user_path(image_path, search_from=search_from)
+
+    if mask_path is not None:
+        return _resolve_user_path(mask_path, search_from=search_from)
+
+    candidate_paths: list[Path] = []
+    image_stem = resolved_image_path.stem
+
+    if resolved_image_path.name.endswith(IMAGE_SUFFIX):
+        candidate_paths.append(
+            resolved_image_path.with_name(
+                f"{resolved_image_path.name[: -len(IMAGE_SUFFIX)]}{MASK_SUFFIX}"
+            )
+        )
+
+    if image_stem.endswith("_image"):
+        candidate_paths.append(
+            resolved_image_path.with_name(f"{image_stem[: -len('_image')]}_mask.png")
+        )
+
+    candidate_paths.append(resolved_image_path.with_name(f"{image_stem}_mask.png"))
+
+    checked: set[Path] = set()
+    for candidate in candidate_paths:
+        resolved_candidate = candidate.resolve()
+        if resolved_candidate in checked:
+            continue
+        checked.add(resolved_candidate)
+        if resolved_candidate.exists():
+            return resolved_candidate
+
+    raise FileNotFoundError(
+        "Could not infer the mask path from the image path. "
+        f"Tried: {[str(path) for path in candidate_paths]}"
+    )
+
+
+def load_sample_from_image_path(
+    image_path: str | Path,
+    *,
+    mask_path: str | Path | None = None,
+    search_from: Path | None = None,
+) -> tuple[pd.Series, np.ndarray, np.ndarray]:
+    resolved_image_path = _resolve_user_path(image_path, search_from=search_from)
+    resolved_mask_path = infer_mask_path_from_image_path(
+        resolved_image_path,
+        mask_path=mask_path,
+        search_from=search_from,
+    )
+
+    sample_row = pd.Series(
+        {
+            "unique_id": sample_id_from_image_path(resolved_image_path),
+            "folder": resolved_image_path.parent.name,
+            "image_path": str(resolved_image_path),
+            "mask_path": str(resolved_mask_path),
+        }
+    )
+    image, mask = load_sample_arrays(sample_row)
+    return sample_row, image, mask
+
+
 def find_repo_root(start: Path | None = None) -> Path:
     start_path = (start or Path.cwd()).resolve()
     for candidate in (start_path, *start_path.parents):
