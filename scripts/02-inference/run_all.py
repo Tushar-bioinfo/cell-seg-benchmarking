@@ -2,21 +2,21 @@ from __future__ import annotations
 
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-INPUT_DIR = PROJECT_ROOT / "data" / "Monusac" / "tiles_256"
+PROJECT_ROOT = Path("/share/lab_teng/trainee/tusharsingh/cell-seg")
+INPUT_DIR = Path("/share/lab_teng/trainee/tusharsingh/cell-seg/data/Monusac/rescaled/patched").resolve()
 OUTPUT_ROOT = PROJECT_ROOT / "inference" / "benchmarking" / "monusac"
 INPUT_MANIFEST = None
-WORKERS = 8
-RAM_LIMIT_GB = 24
+WORKERS = 12
+RAM_LIMIT_GB = 120
 GPU_SLOTS = 1
 OVERWRITE = False
 LIMIT = None
 MODELS_TO_RUN = ("cellpose_sam", "cellsam", "cellvit_sam", "stardist")
 MODEL_RAM_GB = {
-    "cellpose_sam": 6,
-    "cellsam": 6,
-    "cellvit_sam": 8,
-    "stardist": 4,
+    "cellpose_sam": 16,
+    "cellsam": 16,
+    "cellvit_sam": 16,
+    "stardist": 16,
 }
 MODEL_ENVS = {
     "cellpose_sam": "cellpose",
