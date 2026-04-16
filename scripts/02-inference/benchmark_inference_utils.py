@@ -49,6 +49,9 @@ def default_output_root() -> Path:
     return find_repo_root() / "inference" / "benchmarking" / "monusac"
 
 
+PROJECT_ROOT = find_repo_root()
+
+
 def resolve_path(path_like: str | Path) -> Path:
     return Path(path_like).expanduser().resolve()
 
@@ -130,6 +133,7 @@ def _resolve_manifest_image_path(raw_value: Any, *, manifest_path: Path, input_d
         manifest_path.parent / candidate,
         input_dir / candidate,
         input_dir / candidate.name,
+        PROJECT_ROOT / candidate,
     ]
     for item in candidate_paths:
         resolved = item.resolve()

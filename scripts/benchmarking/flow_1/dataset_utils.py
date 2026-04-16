@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
+from common import PROJECT_ROOT
+
 DEFAULT_IMAGE_EXTENSIONS = (".png",)
 DEFAULT_MASK_EXTENSIONS = (".png", ".tif", ".tiff")
 DEFAULT_IMAGE_SUFFIX_TOKEN = "_image"
@@ -99,6 +101,7 @@ def _resolve_recorded_path(raw_value: Any, *, base_dirs: Sequence[Path]) -> Path
     candidate = Path(raw_text).expanduser()
     candidates = [candidate] if candidate.is_absolute() else [base_dir / candidate for base_dir in base_dirs]
     if not candidate.is_absolute():
+        candidates.append(PROJECT_ROOT / candidate)
         candidates.append(candidate)
     checked: set[Path] = set()
     for candidate_path in candidates:
