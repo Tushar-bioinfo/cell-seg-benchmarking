@@ -5,9 +5,27 @@ import argparse
 
 from common import FLOW_ROOT, PROJECT_ROOT, append_flag, append_option, append_repeatable, log, python_command, resolve_path, run_command
 
-DATASET_TAG = "conic_liz"
-DATA_ROOT = PROJECT_ROOT / "data" / DATASET_TAG
-INPUT_MANIFEST = None
+DEFAULT_DATASET_TAGS = ("conic_lizard", "conic_liz")
+
+
+def _default_data_root() -> Path:
+    for dataset_tag in DEFAULT_DATASET_TAGS:
+        candidate = PROJECT_ROOT / "data" / dataset_tag
+        if candidate.exists():
+            return candidate
+    return PROJECT_ROOT / "data" / DEFAULT_DATASET_TAGS[0]
+
+
+def _default_input_manifest(data_root: Path) -> Path | None:
+    candidate = data_root / "dataset_manifest.csv"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+DATA_ROOT = _default_data_root()
+DATASET_TAG = DATA_ROOT.name
+INPUT_MANIFEST = _default_input_manifest(DATA_ROOT)
 IMAGES_SUBDIR = None
 MASKS_SUBDIR = None
 PAIR_MODE = "suffix"
@@ -19,8 +37,7 @@ RECURSIVE_INPUT = True
 RESCALE_OUTPUT_ROOT = None
 TILE_INPUT_ROOT = None
 TILE_OUTPUT_ROOT = None
-# PREDICTION_INPUT_ROOT = PROJECT_ROOT / "data" / DATASET_TAG / "tiles_256" 
-PREDICTION_INPUT_ROOT = PROJECT_ROOT / "data" / DATASET_TAG 
+PREDICTION_INPUT_ROOT = DATA_ROOT
 PREDICTION_OUTPUT_ROOT = PROJECT_ROOT / "inference" / "benchmarking" / DATASET_TAG
 EVALUATION_OUTPUT_DIR = None
 PATCH_SIZE = 256

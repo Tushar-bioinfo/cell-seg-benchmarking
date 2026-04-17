@@ -9,8 +9,12 @@
 
 set -euo pipefail
 
-# PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-PROJECT_ROOT="/share/lab_teng/trainee/tusharsingh/cell-seg"
+SCRIPT_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+DEFAULT_PROJECT_ROOT="/share/lab_teng/trainee/tusharsingh/cell-seg"
+PROJECT_ROOT="${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}"
+if [[ ! -d "${PROJECT_ROOT}" ]]; then
+  PROJECT_ROOT="${SCRIPT_PROJECT_ROOT}"
+fi
 cd "${PROJECT_ROOT}"
 
 # if [[ -f "${HOME}/.bashrc" ]]; then
@@ -21,10 +25,24 @@ cd "${PROJECT_ROOT}"
 WORKERS="${WORKERS:-${SLURM_CPUS_PER_TASK:-24}}"
 RAM_LIMIT_GB="${RAM_LIMIT_GB:-180}"
 GPU_SLOTS="${GPU_SLOTS:-1}"
-DATA_ROOT="${DATA_ROOT:-data/conic_liz}"
-INPUT_MANIFEST="${INPUT_MANIFEST:-data/conic_liz/dataset_manifest.csv}"
+default_data_root() {
+  if [[ -d "data/conic_lizard" ]]; then
+    printf '%s' "data/conic_lizard"
+    return
+  fi
+  if [[ -d "data/conic_liz" ]]; then
+    printf '%s' "data/conic_liz"
+    return
+  fi
+  printf '%s' "data/conic_lizard"
+}
+
+DATA_ROOT="${DATA_ROOT:-$(default_data_root)}"
+INPUT_MANIFEST="${INPUT_MANIFEST:-${DATA_ROOT}/dataset_manifest.csv}"
+DATASET_NAME="${DATASET_NAME:-$(basename "${DATA_ROOT}")}"
+EVAL_OUT="${EVAL_OUT:-${PROJECT_ROOT}/outputs/${DATASET_NAME}}"
 SKIP_RESCALE="${SKIP_RESCALE:-1}"
-SKIP_TILLING="${SKIP_TILLING:-1}"
+SKIP_TILE="${SKIP_TILE:-${SKIP_TILLING:-1}}"
 DRY_RUN="${DRY_RUN:-0}"
 
 LOG_DIR="${PROJECT_ROOT}/logs/flow_1"
@@ -45,6 +63,7 @@ echo "[run_workflow_slurm] project_root=${PROJECT_ROOT}"
 echo "[run_workflow_slurm] data_root=${DATA_ROOT}"
 echo "[run_workflow_slurm] input_manifest=${INPUT_MANIFEST}"
 echo "[run_workflow_slurm] workers=${WORKERS} ram_limit_gb=${RAM_LIMIT_GB} gpu_slots=${GPU_SLOTS}"
+echo "[run_workflow_slurm] eval_out=${EVAL_OUT}"
 echo "[run_workflow_slurm] run_log=${RUN_LOG}"
 echo "[run_workflow_slurm] slurm_job_id=${SLURM_JOB_ID:-manual}"
 echo "[run_workflow_slurm] host=$(hostname)"
@@ -61,14 +80,14 @@ command=(
   --workers "${WORKERS}"
   --ram-limit-gb "${RAM_LIMIT_GB}"
   --gpu-slots "${GPU_SLOTS}"
-  --eval-out "/share/lab_teng/trainee/tusharsingh/cell-seg/outputs/conic_liz"
+  --eval-out "${EVAL_OUT}"
 )
 
 if [[ "${SKIP_RESCALE}" == "1" ]]; then
   command+=(--skip-rescale)
 fi
 
-if [[ "${SKIP_TILLING}" == "1" ]]; then
+if [[ "${SKIP_TILE}" == "1" ]]; then
   command+=(--skip-tile)
 fi
 

@@ -1165,19 +1165,48 @@ def _resolve_ground_truth_mask_path_from_manifest_row(
         )
 
     gt_mask_path = Path(gt_mask_path_text).expanduser()
+    candidate_paths: list[Path] = []
     if gt_mask_path.is_absolute():
-        return gt_mask_path.resolve()
+        candidate_paths.append(gt_mask_path.resolve())
+    else:
+        input_root = _derive_input_root_from_manifest_row(
+            row,
+            manifest_path=manifest_path,
+            row_number=row_number,
+        )
+        repo_root = _repo_root()
+        candidate_paths.append((repo_root / gt_mask_path).resolve())
 
-    repo_relative_gt_path = (_repo_root() / gt_mask_path).resolve()
-    if repo_relative_gt_path.is_file():
-        return repo_relative_gt_path
+        try:
+            input_root_relative_to_repo = input_root.resolve().relative_to(repo_root)
+        except ValueError:
+            input_root_relative_to_repo = None
 
-    input_root = _derive_input_root_from_manifest_row(
-        row,
-        manifest_path=manifest_path,
-        row_number=row_number,
+        if input_root_relative_to_repo is not None:
+            gt_parts = gt_mask_path.parts
+            prefix_parts = input_root_relative_to_repo.parts
+            if len(gt_parts) >= len(prefix_parts) and gt_parts[: len(prefix_parts)] == prefix_parts:
+                stripped_parts = gt_parts[len(prefix_parts) :]
+                if stripped_parts:
+                    candidate_paths.append((input_root / Path(*stripped_parts)).resolve())
+
+        candidate_paths.append((input_root / gt_mask_path).resolve())
+
+    checked_paths: list[Path] = []
+    seen_paths: set[Path] = set()
+    for candidate_path in candidate_paths:
+        if candidate_path in seen_paths:
+            continue
+        seen_paths.add(candidate_path)
+        checked_paths.append(candidate_path)
+        if candidate_path.is_file():
+            return candidate_path
+
+    checked_text = ", ".join(str(path) for path in checked_paths)
+    raise FileNotFoundError(
+        f"Could not resolve `mask_path` {gt_mask_path_text!r} from row {row_number} in {manifest_path}. "
+        f"Tried: {checked_text}"
     )
-    return (input_root / gt_mask_path).resolve()
 
 
 def _resolve_predicted_mask_path_from_manifest_row(
