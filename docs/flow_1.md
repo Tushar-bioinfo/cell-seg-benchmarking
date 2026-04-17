@@ -353,7 +353,8 @@ Each model writes:
 - Required `predictions.csv` columns:
   - `predicted_mask_path`
   - `mask_path`
-- If `mask_path` is relative, the evaluator derives the tile root from:
+- If `mask_path` is relative and already points to a repo-relative file such as `data/conic_lizard/...`, the evaluator uses that recorded repo-relative path directly.
+- Otherwise, if `mask_path` is relative, the evaluator derives the tile root from:
   - `source_image_path`
   - plus `relative_image_path` or `image_path`
 

@@ -97,7 +97,8 @@ Path resolution details:
 - If `predicted_mask_path` is absolute, it is used directly.
 - If `predicted_mask_path` is relative, it is resolved relative to the manifest directory.
 - If `mask_path` is absolute, it is used directly.
-- If `mask_path` is relative, the evaluator derives the tiled input root by removing `relative_image_path` or `image_path` from the recorded `source_image_path`.
+- If `mask_path` is relative and already points to a repo-relative file such as `data/conic_lizard/...`, the evaluator uses that recorded repo-relative path directly.
+- Otherwise, if `mask_path` is relative, the evaluator derives the tiled input root by removing `relative_image_path` or `image_path` from the recorded `source_image_path`.
 - This avoids hardcoded dataset roots and keeps evaluation tied to the exact inference manifest row.
 
 Row identification details:

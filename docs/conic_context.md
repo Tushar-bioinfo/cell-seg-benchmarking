@@ -37,6 +37,7 @@
 - Raw CoNIC patches are already `256x256`. Default `flow_1` rescaling (`40x -> 20x`) shrinks them to `128x128`, which yields zero `256`-pixel tiles.
 - For raw CoNIC manifests, prefer `--skip-rescale`.
 - If rescaling is intentional, pass `--images-subdir images --masks-subdir masks` so rescaled outputs stay under `images/...` and `masks/...` instead of `images/images/...`.
+- Raw CoNIC manifests keep project-relative paths such as `data/conic_lizard/...`; the evaluator now accepts those recorded paths directly, but the standard full workflow still prefers evaluating from tiled `predictions.csv`.
 
 ## Stable Paths
 

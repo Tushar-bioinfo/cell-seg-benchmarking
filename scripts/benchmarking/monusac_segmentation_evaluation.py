@@ -1168,6 +1168,10 @@ def _resolve_ground_truth_mask_path_from_manifest_row(
     if gt_mask_path.is_absolute():
         return gt_mask_path.resolve()
 
+    repo_relative_gt_path = (_repo_root() / gt_mask_path).resolve()
+    if repo_relative_gt_path.is_file():
+        return repo_relative_gt_path
+
     input_root = _derive_input_root_from_manifest_row(
         row,
         manifest_path=manifest_path,
