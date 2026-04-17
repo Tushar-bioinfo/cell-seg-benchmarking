@@ -20,3 +20,7 @@ pixis/*
 AGENTS.md
 
 tmp/*
+
+logs/*
+
+outputs/*

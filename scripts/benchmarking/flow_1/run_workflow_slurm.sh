@@ -9,20 +9,22 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+PROJECT_ROOT="/share/lab_teng/trainee/tusharsingh/cell-seg"
 cd "${PROJECT_ROOT}"
 
-if [[ -f "${HOME}/.bashrc" ]]; then
-  # shellcheck disable=SC1090
-  source "${HOME}/.bashrc"
-fi
+# if [[ -f "${HOME}/.bashrc" ]]; then
+#   # shellcheck disable=SC1090
+#   source "${HOME}/.bashrc"
+# fi
 
 WORKERS="${WORKERS:-${SLURM_CPUS_PER_TASK:-24}}"
 RAM_LIMIT_GB="${RAM_LIMIT_GB:-180}"
 GPU_SLOTS="${GPU_SLOTS:-1}"
-DATA_ROOT="${DATA_ROOT:-data/conic_lizard}"
-INPUT_MANIFEST="${INPUT_MANIFEST:-data/conic_lizard/dataset_manifest.csv}"
+DATA_ROOT="${DATA_ROOT:-data/conic_liz}"
+INPUT_MANIFEST="${INPUT_MANIFEST:-data/conic_liz/dataset_manifest.csv}"
 SKIP_RESCALE="${SKIP_RESCALE:-1}"
+SKIP_TILLING="${SKIP_TILLING:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
 LOG_DIR="${PROJECT_ROOT}/logs/flow_1"
@@ -59,10 +61,15 @@ command=(
   --workers "${WORKERS}"
   --ram-limit-gb "${RAM_LIMIT_GB}"
   --gpu-slots "${GPU_SLOTS}"
+  --eval-out "/share/lab_teng/trainee/tusharsingh/cell-seg/outputs/conic_liz"
 )
 
 if [[ "${SKIP_RESCALE}" == "1" ]]; then
   command+=(--skip-rescale)
+fi
+
+if [[ "${SKIP_TILLING}" == "1" ]]; then
+  command+=(--skip-tile)
 fi
 
 if [[ -n "${IMAGES_SUBDIR:-}" ]]; then

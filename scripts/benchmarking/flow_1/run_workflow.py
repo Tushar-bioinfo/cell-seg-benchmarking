@@ -5,7 +5,7 @@ import argparse
 
 from common import FLOW_ROOT, PROJECT_ROOT, append_flag, append_option, append_repeatable, log, python_command, resolve_path, run_command
 
-DATASET_TAG = "benchmark_input"
+DATASET_TAG = "conic_liz"
 DATA_ROOT = PROJECT_ROOT / "data" / DATASET_TAG
 INPUT_MANIFEST = None
 IMAGES_SUBDIR = None
@@ -19,7 +19,8 @@ RECURSIVE_INPUT = True
 RESCALE_OUTPUT_ROOT = None
 TILE_INPUT_ROOT = None
 TILE_OUTPUT_ROOT = None
-PREDICTION_INPUT_ROOT = PROJECT_ROOT / "data" / DATASET_TAG / "tiles_256"
+# PREDICTION_INPUT_ROOT = PROJECT_ROOT / "data" / DATASET_TAG / "tiles_256" 
+PREDICTION_INPUT_ROOT = PROJECT_ROOT / "data" / DATASET_TAG 
 PREDICTION_OUTPUT_ROOT = PROJECT_ROOT / "inference" / "benchmarking" / DATASET_TAG
 EVALUATION_OUTPUT_DIR = None
 PATCH_SIZE = 256
@@ -28,8 +29,8 @@ SOURCE_MAGNIFICATION = 40.0
 TARGET_MAGNIFICATION = 20.0
 MIN_INSTANCE_FRACTION = 0.25
 MODELS_TO_RUN = ("cellpose_sam", "cellsam", "cellvit_sam", "stardist")
-WORKERS = 8
-RAM_LIMIT_GB = 24
+WORKERS = 12
+RAM_LIMIT_GB = 100
 GPU_SLOTS = 1
 LIMIT = None
 OVERWRITE = False
