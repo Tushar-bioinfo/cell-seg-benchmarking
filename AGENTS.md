@@ -19,6 +19,8 @@
   Use for `scripts/02-inference/`, model-output structure, `predictions.csv`, and Pixi execution details.
 - `docs/embedding.md`
   Use for tile-level embedding extraction, Prov-GigaPath tile-encoder loading, input CSV expectations, output layout, and resume behavior.
+- `docs/morphology_labels_context.md`
+  Use for morphology feature extraction manifests, path resolution, mask/image format rules, output CSV layout, and failure semantics.
 - `docs/flow_1.md`
   Use when asked questions related to `flow_1`.
 - `scripts/benchmarking/README.md`
@@ -31,6 +33,7 @@
 - Keep paired stems as `*_image.png` and `*_mask.png`.
 - Preserve manifest columns and relative path semantics when writing derived outputs.
 - For embedding outputs, preserve all input CSV columns and keep `input_row_index` plus a stable tile ID such as `patch_id` whenever available.
+- For morphology outputs, preserve manifest metadata columns, keep `input_row_index`, and treat recorded `image_path` and `mask_path` values as the path source of truth.
 - For MoNuSAC evaluation, treat each model's `predictions.csv` as the path source of truth. Do not reconstruct GT or prediction paths from naming assumptions when the manifest already records them.
 - Keep the top-of-file config blocks intact in `scripts/02-inference/*.py`.
 - Expect full model execution on Linux or HPC. On macOS, validation may be limited to syntax or static checks.
