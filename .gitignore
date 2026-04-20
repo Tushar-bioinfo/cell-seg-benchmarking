@@ -4,6 +4,8 @@
 
 # local machine metadata
 .DS_Store
+__pycache__/
+*.pyc
 
 # local Codex context
 .codex/

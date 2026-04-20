@@ -9,7 +9,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import torch
 from tqdm import tqdm
 
 DEFAULT_INPUT_CSV = Path("outputs/conic_liz/embed_morph.csv")
@@ -42,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the embedding-table export workflow."""
 
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=(
             "Expand embedding vectors referenced by a metadata CSV into flat embedding columns and export "
             "full + sample_id-only CSV tables."
@@ -122,6 +122,19 @@ def parse_args() -> argparse.Namespace:
         help="Enable debug-level logging.",
     )
     return parser.parse_args()
+
+
+def _import_torch():
+    """Import torch lazily so --help and static inspection do not require the runtime dependency."""
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError(
+            "This script requires PyTorch to load .pt embedding files. Install torch in the runtime environment "
+            "before executing the export workflow."
+        ) from exc
+    return torch
 
 
 def configure_logging(verbose: bool) -> logging.Logger:
@@ -296,6 +309,7 @@ def normalize_embedding_format(value: Any, *, column_name: str, row_context: str
 def summarize_object(obj: Any) -> str:
     """Return a compact description of a loaded object for error reporting."""
 
+    torch = _import_torch()
     if torch.is_tensor(obj):
         return f"torch.Tensor(shape={tuple(obj.shape)}, dtype={obj.dtype}, device={obj.device})"
     if isinstance(obj, np.ndarray):
@@ -314,6 +328,7 @@ def summarize_object(obj: Any) -> str:
 def load_pt_object(path: Path) -> Any:
     """Load a .pt payload onto CPU with broad compatibility across torch versions."""
 
+    torch = _import_torch()
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
@@ -325,6 +340,7 @@ def load_pt_object(path: Path) -> Any:
 def _coerce_numeric_array(value: Any, *, source_label: str, path: Path) -> np.ndarray:
     """Convert a candidate embedding container into a numeric 1D or 2D numpy array."""
 
+    torch = _import_torch()
     if torch.is_tensor(value):
         array = value.detach().cpu().numpy()
     elif isinstance(value, np.ndarray):
@@ -366,6 +382,26 @@ def _coerce_numeric_array(value: Any, *, source_label: str, path: Path) -> np.nd
     return np.asarray(array, dtype=np.float32)
 
 
+def _find_unique_matrix_candidate_in_dict(payload: dict[Any, Any], *, path: Path) -> tuple[Any, str] | None:
+    """Return a single unambiguous 2D numeric candidate from a dict payload when present."""
+
+    matrix_candidates: list[tuple[Any, Any]] = []
+    for key, value in payload.items():
+        try:
+            candidate_array = _coerce_numeric_array(value, source_label=f"dict[{key!r}]", path=path)
+        except Exception:
+            continue
+        if candidate_array.ndim == 2:
+            matrix_candidates.append((key, value))
+            if len(matrix_candidates) > 1:
+                return None
+
+    if len(matrix_candidates) == 1:
+        key, value = matrix_candidates[0]
+        return value, f"dict[{key!r}]"
+    return None
+
+
 def _extract_candidate_from_dict(payload: dict[Any, Any], *, path: Path) -> tuple[Any, str]:
     """Choose the most likely embedding container from a dictionary payload."""
 
@@ -385,6 +421,10 @@ def _extract_candidate_from_dict(payload: dict[Any, Any], *, path: Path) -> tupl
     if len(payload) == 1:
         only_key = next(iter(payload.keys()))
         return payload[only_key], f"dict[{only_key!r}]"
+
+    unique_matrix_candidate = _find_unique_matrix_candidate_in_dict(payload, path=path)
+    if unique_matrix_candidate is not None:
+        return unique_matrix_candidate
 
     item_summaries = ", ".join(f"{key!r}: {summarize_object(value)}" for key, value in list(payload.items())[:8])
     if len(payload) > 8:
@@ -580,8 +620,15 @@ def write_outputs(
     embedding_columns = get_embedding_column_names(embedding_matrix.shape[1], prefix)
     embedding_frame = pd.DataFrame(embedding_matrix, columns=embedding_columns, index=dataframe.index)
 
-    full_output_path = output_dir / full_output_name
-    embeddings_only_path = output_dir / embeddings_only_name
+    full_output_path = output_dir / Path(full_output_name)
+    embeddings_only_path = output_dir / Path(embeddings_only_name)
+    if full_output_path.resolve() == embeddings_only_path.resolve():
+        raise ValueError(
+            "The full output path and embeddings-only output path resolve to the same file. "
+            "Choose different values for --full-output-name and --embeddings-only-name."
+        )
+    full_output_path.parent.mkdir(parents=True, exist_ok=True)
+    embeddings_only_path.parent.mkdir(parents=True, exist_ok=True)
 
     full_frame = pd.concat([dataframe.reset_index(drop=True), embedding_frame.reset_index(drop=True)], axis=1)
     embeddings_only_frame = pd.concat(
@@ -611,6 +658,7 @@ def main() -> int:
     logger.info("Output directory: %s", output_dir)
     if repo_root is not None:
         logger.info("Repo root: %s", repo_root)
+    logger.info("Row order is preserved from the input CSV.")
 
     if not input_csv.exists():
         raise FileNotFoundError(f"Input CSV does not exist: {input_csv}")
