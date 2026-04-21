@@ -24,7 +24,7 @@ AGENTS.md
 tmp/*
 
 logs/*
-
-outputs/**
-!outputs/**/
-!outputs/**/*.csv
+outputs/*
+#outputs/**
+#!outputs/**/
+#!outputs/**/*.csv
