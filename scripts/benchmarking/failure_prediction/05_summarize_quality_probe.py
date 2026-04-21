@@ -223,6 +223,20 @@ def summarize_predictions_table(predictions: pd.DataFrame) -> dict[str, Any]:
             summary["predictions.prediction_score_mean"] = float(valid_scores.mean())
             summary["predictions.prediction_score_std"] = float(valid_scores.std(ddof=0))
 
+    for column in ("predicted_failure_probability", "predicted_quality_probability"):
+        if column in predictions.columns:
+            score_series = pd.to_numeric(predictions[column], errors="coerce")
+            valid_scores = score_series.dropna()
+            if not valid_scores.empty:
+                summary[f"predictions.{column}.mean"] = float(valid_scores.mean())
+                summary[f"predictions.{column}.std"] = float(valid_scores.std(ddof=0))
+
+    for column in ("predicted_failure_label", "predicted_quality_label"):
+        if column in predictions.columns:
+            label_counts = predictions[column].value_counts(dropna=False).to_dict()
+            for label, count in label_counts.items():
+                summary[f"predictions.{column}_count.{label}"] = int(count)
+
     return summary
 
 
@@ -304,10 +318,11 @@ def summarize_inference_table(path: Path) -> dict[str, Any]:
         summary[f"inference.{column}.min"] = float(values.min())
         summary[f"inference.{column}.max"] = float(values.max())
 
-    if "predicted_quality_label" in table.columns:
-        label_counts = table["predicted_quality_label"].value_counts(dropna=False).to_dict()
-        for label, count in label_counts.items():
-            summary[f"inference.predicted_quality_label_count.{label}"] = int(count)
+    for column in ("predicted_failure_label", "predicted_quality_label"):
+        if column in table.columns:
+            label_counts = table[column].value_counts(dropna=False).to_dict()
+            for label, count in label_counts.items():
+                summary[f"inference.{column}_count.{label}"] = int(count)
 
     return summary
 

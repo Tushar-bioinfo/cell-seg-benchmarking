@@ -32,8 +32,14 @@ else
 fi
 EXPERIMENT_DIR="${EXPERIMENT_DIR:-${DEFAULT_EXPERIMENT_DIR}}"
 
-PATCH_MANIFEST_INPUT="${PATCH_MANIFEST_INPUT:-outputs/conic_liz/embeddings/metadata/embeddings_index.parquet}"
+PATCH_MANIFEST_INPUT="${PATCH_MANIFEST_INPUT:-outputs/embeddings/metadata/embeddings_index.parquet}"
 PATCH_MANIFEST_OUTPUT="${PATCH_MANIFEST_OUTPUT:-${EXPERIMENT_DIR}/patch_manifest.parquet}"
+PATCH_MANIFEST_PATCH_ID_COL="${PATCH_MANIFEST_PATCH_ID_COL:-sample_id}"
+PATCH_MANIFEST_SLIDE_ID_COL="${PATCH_MANIFEST_SLIDE_ID_COL:-sample_id}"
+PATCH_MANIFEST_SLIDE_ID_STRIP_REGEX="${PATCH_MANIFEST_SLIDE_ID_STRIP_REGEX:--[^-]+$}"
+PATCH_MANIFEST_DATASET_VALUE="${PATCH_MANIFEST_DATASET_VALUE:-conic_liz}"
+PATCH_MANIFEST_SPLIT_VALUE="${PATCH_MANIFEST_SPLIT_VALUE:-all}"
+PATCH_MANIFEST_EXTRA_COLS="${PATCH_MANIFEST_EXTRA_COLS:-conic_index image_path mask_path class_label_path resolved_image_path embedding_row_offset embedding_format embedding_dim}"
 
 EVAL_DIR="${EVAL_DIR:-outputs/conic_liz}"
 EVAL_GLOB="${EVAL_GLOB:-*_evaluation.csv}"
@@ -41,11 +47,19 @@ JOINED_MANIFEST_OUTPUT="${JOINED_MANIFEST_OUTPUT:-${EXPERIMENT_DIR}/patch_manife
 
 TRAIN_INPUT="${TRAIN_INPUT:-${JOINED_MANIFEST_OUTPUT}}"
 TRAIN_OUTPUT_DIR="${TRAIN_OUTPUT_DIR:-${EXPERIMENT_DIR}/quality_probe}"
-TRAIN_PROBLEM_TYPE="${TRAIN_PROBLEM_TYPE:-regression}"
+TRAIN_PROBLEM_TYPE="${TRAIN_PROBLEM_TYPE:-classification}"
 TRAIN_FEATURE_MODE="${TRAIN_FEATURE_MODE:-embedding_only}"
 TRAIN_TARGET_COL="${TRAIN_TARGET_COL:-instance_pq}"
+TRAIN_TARGET_AGGREGATION="${TRAIN_TARGET_AGGREGATION:-median}"
 TRAIN_GROUP_COL="${TRAIN_GROUP_COL:-slide_id}"
-TRAIN_CLASSIFICATION_THRESHOLD="${TRAIN_CLASSIFICATION_THRESHOLD:-0.5}"
+TRAIN_CLASSIFICATION_THRESHOLD_STRATEGY="${TRAIN_CLASSIFICATION_THRESHOLD_STRATEGY:-train_median}"
+TRAIN_CLASSIFICATION_THRESHOLD="${TRAIN_CLASSIFICATION_THRESHOLD:-}"
+TRAIN_POSITIVE_CLASS_NAME="${TRAIN_POSITIVE_CLASS_NAME:-failure}"
+TRAIN_CLASSIFIER_FAMILIES="${TRAIN_CLASSIFIER_FAMILIES:-logistic_regression random_forest svm}"
+TRAIN_OPTUNA_TRIALS="${TRAIN_OPTUNA_TRIALS:-40}"
+TRAIN_CV_FOLDS="${TRAIN_CV_FOLDS:-5}"
+TRAIN_N_JOBS="${TRAIN_N_JOBS:-1}"
+TRAIN_REQUIRE_COMPLETE_MODEL_COVERAGE="${TRAIN_REQUIRE_COMPLETE_MODEL_COVERAGE:-1}"
 TRAIN_AUTO_METADATA_COLS="${TRAIN_AUTO_METADATA_COLS:-0}"
 TRAIN_METADATA_COLS="${TRAIN_METADATA_COLS:-}"
 TRAIN_REQUIRE_EXISTING_EMBEDDINGS="${TRAIN_REQUIRE_EXISTING_EMBEDDINGS:-0}"
@@ -66,6 +80,11 @@ echo "[quality_probe_slurm] experiment_name=${EXPERIMENT_NAME}"
 echo "[quality_probe_slurm] experiment_dir=${EXPERIMENT_DIR}"
 echo "[quality_probe_slurm] patch_manifest_input=${PATCH_MANIFEST_INPUT}"
 echo "[quality_probe_slurm] patch_manifest_output=${PATCH_MANIFEST_OUTPUT}"
+echo "[quality_probe_slurm] patch_manifest_patch_id_col=${PATCH_MANIFEST_PATCH_ID_COL}"
+echo "[quality_probe_slurm] patch_manifest_slide_id_col=${PATCH_MANIFEST_SLIDE_ID_COL}"
+echo "[quality_probe_slurm] patch_manifest_slide_id_strip_regex=${PATCH_MANIFEST_SLIDE_ID_STRIP_REGEX}"
+echo "[quality_probe_slurm] patch_manifest_dataset_value=${PATCH_MANIFEST_DATASET_VALUE}"
+echo "[quality_probe_slurm] patch_manifest_split_value=${PATCH_MANIFEST_SPLIT_VALUE}"
 echo "[quality_probe_slurm] eval_dir=${EVAL_DIR}"
 echo "[quality_probe_slurm] eval_glob=${EVAL_GLOB}"
 echo "[quality_probe_slurm] joined_manifest_output=${JOINED_MANIFEST_OUTPUT}"
@@ -74,7 +93,14 @@ echo "[quality_probe_slurm] train_output_dir=${TRAIN_OUTPUT_DIR}"
 echo "[quality_probe_slurm] train_problem_type=${TRAIN_PROBLEM_TYPE}"
 echo "[quality_probe_slurm] train_feature_mode=${TRAIN_FEATURE_MODE}"
 echo "[quality_probe_slurm] train_target_col=${TRAIN_TARGET_COL}"
+echo "[quality_probe_slurm] train_target_aggregation=${TRAIN_TARGET_AGGREGATION}"
 echo "[quality_probe_slurm] train_group_col=${TRAIN_GROUP_COL}"
+echo "[quality_probe_slurm] train_classification_threshold_strategy=${TRAIN_CLASSIFICATION_THRESHOLD_STRATEGY}"
+echo "[quality_probe_slurm] train_positive_class_name=${TRAIN_POSITIVE_CLASS_NAME}"
+echo "[quality_probe_slurm] train_classifier_families=${TRAIN_CLASSIFIER_FAMILIES}"
+echo "[quality_probe_slurm] train_optuna_trials=${TRAIN_OPTUNA_TRIALS}"
+echo "[quality_probe_slurm] train_cv_folds=${TRAIN_CV_FOLDS}"
+echo "[quality_probe_slurm] train_n_jobs=${TRAIN_N_JOBS}"
 echo "[quality_probe_slurm] infer_input=${INFER_INPUT}"
 echo "[quality_probe_slurm] infer_output=${INFER_OUTPUT}"
 echo "[quality_probe_slurm] summary_output=${SUMMARY_OUTPUT}"
@@ -102,9 +128,16 @@ run_command() {
 }
 
 if [[ "${RUN_BUILD_MANIFEST}" == "1" ]]; then
+  read -r -a patch_manifest_extra_cols <<< "${PATCH_MANIFEST_EXTRA_COLS}"
   run_command \
     pixi run -e default python scripts/benchmarking/failure_prediction/01_build_patch_manifest.py \
     --input "${PATCH_MANIFEST_INPUT}" \
+    --patch-id-col "${PATCH_MANIFEST_PATCH_ID_COL}" \
+    --slide-id-col "${PATCH_MANIFEST_SLIDE_ID_COL}" \
+    --slide-id-strip-regex "${PATCH_MANIFEST_SLIDE_ID_STRIP_REGEX}" \
+    --dataset-value "${PATCH_MANIFEST_DATASET_VALUE}" \
+    --split-value "${PATCH_MANIFEST_SPLIT_VALUE}" \
+    --extra-cols "${patch_manifest_extra_cols[@]}" \
     --output "${PATCH_MANIFEST_OUTPUT}"
 fi
 
@@ -118,6 +151,7 @@ if [[ "${RUN_ATTACH_TARGETS}" == "1" ]]; then
 fi
 
 if [[ "${RUN_TRAIN}" == "1" ]]; then
+  read -r -a classifier_families <<< "${TRAIN_CLASSIFIER_FAMILIES}"
   train_command=(
     pixi run -e default python scripts/benchmarking/failure_prediction/03_train_quality_probe.py
     --input "${TRAIN_INPUT}"
@@ -125,8 +159,14 @@ if [[ "${RUN_TRAIN}" == "1" ]]; then
     --problem-type "${TRAIN_PROBLEM_TYPE}"
     --feature-mode "${TRAIN_FEATURE_MODE}"
     --target-col "${TRAIN_TARGET_COL}"
+    --target-aggregation "${TRAIN_TARGET_AGGREGATION}"
     --group-col "${TRAIN_GROUP_COL}"
-    --classification-threshold "${TRAIN_CLASSIFICATION_THRESHOLD}"
+    --classification-threshold-strategy "${TRAIN_CLASSIFICATION_THRESHOLD_STRATEGY}"
+    --positive-class-name "${TRAIN_POSITIVE_CLASS_NAME}"
+    --classifier-families "${classifier_families[@]}"
+    --optuna-trials "${TRAIN_OPTUNA_TRIALS}"
+    --cv-folds "${TRAIN_CV_FOLDS}"
+    --n-jobs "${TRAIN_N_JOBS}"
   )
 
   if [[ "${TRAIN_AUTO_METADATA_COLS}" == "1" ]]; then
@@ -135,6 +175,16 @@ if [[ "${RUN_TRAIN}" == "1" ]]; then
 
   if [[ "${TRAIN_REQUIRE_EXISTING_EMBEDDINGS}" == "1" ]]; then
     train_command+=(--require-existing-embeddings)
+  fi
+
+  if [[ "${TRAIN_REQUIRE_COMPLETE_MODEL_COVERAGE}" == "1" ]]; then
+    train_command+=(--require-complete-model-coverage)
+  else
+    train_command+=(--no-require-complete-model-coverage)
+  fi
+
+  if [[ -n "${TRAIN_CLASSIFICATION_THRESHOLD}" ]]; then
+    train_command+=(--classification-threshold "${TRAIN_CLASSIFICATION_THRESHOLD}")
   fi
 
   if [[ -n "${TRAIN_METADATA_COLS}" ]]; then

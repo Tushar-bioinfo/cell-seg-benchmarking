@@ -6,28 +6,35 @@ import json
 import logging
 import pickle
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.dummy import DummyClassifier, DummyRegressor
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     balanced_accuracy_score,
-    classification_report,
+    confusion_matrix,
     f1_score,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
+    log_loss,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
     roc_auc_score,
+    roc_curve,
 )
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold, learning_curve
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import SVC
 from tqdm import tqdm
 
 
@@ -43,18 +50,31 @@ DEFAULT_EMBEDDING_OFFSET_COL = "embedding_row_offset"
 DEFAULT_EMBEDDING_FORMAT_COL = "embedding_format"
 DEFAULT_GROUP_COL = "slide_id"
 DEFAULT_TARGET_COL = "instance_pq"
-DEFAULT_PROBLEM_TYPE = "regression"
+DEFAULT_PROBLEM_TYPE = "classification"
 DEFAULT_FEATURE_MODE = "embedding_only"
-DEFAULT_CLASSIFICATION_THRESHOLD = 0.5
 DEFAULT_TEST_SIZE = 0.2
 DEFAULT_RANDOM_SEED = 42
 DEFAULT_MAX_TRAIN_ROWS = None
 DEFAULT_PROGRESS = True
+DEFAULT_OPTUNA_TRIALS = 40
+DEFAULT_CV_FOLDS = 5
+DEFAULT_CLASSIFIER_FAMILIES = ("logistic_regression", "random_forest", "svm")
+DEFAULT_TARGET_AGGREGATION = "median"
+DEFAULT_THRESHOLD_STRATEGY = "train_median"
+DEFAULT_CLASSIFICATION_THRESHOLD = None
+DEFAULT_REQUIRE_COMPLETE_MODEL_COVERAGE = True
+DEFAULT_POSITIVE_CLASS_NAME = "failure"
+DEFAULT_PLOTS_DIR_NAME = "plots"
+DEFAULT_OPTUNA_TRIALS_OUTPUT_NAME = "study_trials.csv"
+DEFAULT_BEST_PARAMS_OUTPUT_NAME = "best_params.json"
+DEFAULT_AGGREGATED_OUTPUT_NAME = "aggregated_patch_targets.parquet"
+DEFAULT_FAMILY_METRICS_OUTPUT_NAME = "candidate_family_metrics.json"
 DEFAULT_METRICS_OUTPUT_NAME = "metrics.json"
 DEFAULT_CONFIG_OUTPUT_NAME = "config.json"
 DEFAULT_PREDICTIONS_OUTPUT_NAME = "predictions.csv"
 DEFAULT_MODEL_OUTPUT_NAME = "predictor.pkl"
 DEFAULT_SCALER_OUTPUT_NAME = "scaler.pkl"
+DEFAULT_N_JOBS = 1
 
 SUPPORTED_EMBEDDING_FORMATS = {"pt"}
 COMMON_TENSOR_KEYS = (
@@ -70,11 +90,10 @@ COMMON_TENSOR_KEYS = (
 )
 HEURISTIC_KEY_TOKENS = ("emb", "feature", "vector", "tensor")
 FEATURE_MODES = {"embedding_only", "metadata_only", "embedding_plus_metadata"}
-PROBLEM_TYPES = {"regression", "classification"}
-BASELINE_MODELS = {
-    "regression": {"dummy_mean", "ridge"},
-    "classification": {"dummy_most_frequent", "logistic"},
-}
+PROBLEM_TYPES = {"classification"}
+CLASSIFIER_FAMILIES = {"logistic_regression", "random_forest", "svm"}
+TARGET_AGGREGATIONS = {"median", "mean"}
+THRESHOLD_STRATEGIES = {"train_median", "fixed"}
 LEAKAGE_COLUMN_DEFAULTS = {
     "target",
     "target_binary",
@@ -83,12 +102,26 @@ LEAKAGE_COLUMN_DEFAULTS = {
     "prediction",
     "predictions",
     "pred_score",
+    "prediction_score",
     "score",
+    "quality",
+    "pq",
+    "dice",
 }
+AUTO_METADATA_EXCLUDE_TOKENS = (
+    "path",
+    "offset",
+    "format",
+    "embedding",
+    "index",
+    "row",
+    "mask",
+    "class_label",
+)
 
 
 @dataclass
-class TrainSplit:
+class OuterSplit:
     train_indices: np.ndarray
     test_indices: np.ndarray
     train_groups: np.ndarray
@@ -99,8 +132,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=(
-            "Train simple baseline probes to predict segmentation quality from embeddings and/or metadata. "
-            "Supports grouped train/test splits and saves model artifacts plus evaluation outputs."
+            "Train a patch-level failure predictor from embeddings by first aggregating per-model segmentation "
+            "quality into a single patch target, then tuning multiple classifier families with grouped CV."
         ),
     )
     parser.add_argument(
@@ -165,24 +198,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--group-col",
         default=DEFAULT_GROUP_COL,
-        help="Column used for grouped splitting. Often slide_id.",
+        help="Column used for grouped splitting. Usually slide_id.",
     )
     parser.add_argument(
         "--target-col",
         default=DEFAULT_TARGET_COL,
-        help="Target metric column to predict.",
+        help="Per-model metric column aggregated into a patch-level target, for example instance_pq.",
+    )
+    parser.add_argument(
+        "--target-aggregation",
+        choices=sorted(TARGET_AGGREGATIONS),
+        default=DEFAULT_TARGET_AGGREGATION,
+        help="Aggregation applied across model rows for each patch.",
     )
     parser.add_argument(
         "--problem-type",
         choices=sorted(PROBLEM_TYPES),
         default=DEFAULT_PROBLEM_TYPE,
-        help="Train a regression or classification baseline.",
+        help="Only grouped classification is supported in this Optuna-tuned training flow.",
+    )
+    parser.add_argument(
+        "--classification-threshold-strategy",
+        choices=sorted(THRESHOLD_STRATEGIES),
+        default=DEFAULT_THRESHOLD_STRATEGY,
+        help="How to convert the aggregated continuous target into a binary label.",
     )
     parser.add_argument(
         "--classification-threshold",
         type=float,
         default=DEFAULT_CLASSIFICATION_THRESHOLD,
-        help="Threshold used to derive binary labels when --problem-type=classification.",
+        help=(
+            "Optional fixed threshold for binary labels. "
+            "If omitted with --classification-threshold-strategy=train_median, the threshold is learned from the outer training split."
+        ),
+    )
+    parser.add_argument(
+        "--positive-class-name",
+        choices=("failure", "quality"),
+        default=DEFAULT_POSITIVE_CLASS_NAME,
+        help="Which semantic class is encoded as label 1.",
     )
     parser.add_argument(
         "--feature-mode",
@@ -195,14 +249,14 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=[],
         help=(
-            "Explicit metadata feature columns to use. "
+            "Explicit metadata feature columns to use after patch-level aggregation. "
             "Required for metadata_only or embedding_plus_metadata unless --auto-metadata-cols is enabled."
         ),
     )
     parser.add_argument(
         "--auto-metadata-cols",
         action="store_true",
-        help="Infer metadata columns from the manifest by excluding known identifier/target/embedding columns.",
+        help="Infer metadata columns from the aggregated patch table by excluding known identifier, path, and target columns.",
     )
     parser.add_argument(
         "--exclude-metadata-cols",
@@ -211,22 +265,59 @@ def parse_args() -> argparse.Namespace:
         help="Metadata columns to exclude from training when using --auto-metadata-cols.",
     )
     parser.add_argument(
+        "--require-complete-model-coverage",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_REQUIRE_COMPLETE_MODEL_COVERAGE,
+        help="Drop patches that do not have valid target values from every expected model.",
+    )
+    parser.add_argument(
+        "--classifier-families",
+        nargs="+",
+        choices=sorted(CLASSIFIER_FAMILIES),
+        default=list(DEFAULT_CLASSIFIER_FAMILIES),
+        help="Classifier families tuned independently with Optuna.",
+    )
+    parser.add_argument(
+        "--optuna-trials",
+        type=int,
+        default=DEFAULT_OPTUNA_TRIALS,
+        help="Number of Optuna trials run per classifier family.",
+    )
+    parser.add_argument(
+        "--optuna-timeout",
+        type=int,
+        default=None,
+        help="Optional Optuna timeout in seconds per classifier family.",
+    )
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=DEFAULT_CV_FOLDS,
+        help="Number of grouped CV folds inside the Optuna objective.",
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=DEFAULT_N_JOBS,
+        help="Thread count used by selected estimators and some plotting helpers.",
+    )
+    parser.add_argument(
         "--test-size",
         type=float,
         default=DEFAULT_TEST_SIZE,
-        help="Fraction of groups assigned to the test split.",
+        help="Fraction of groups assigned to the outer held-out test split.",
     )
     parser.add_argument(
         "--random-seed",
         type=int,
         default=DEFAULT_RANDOM_SEED,
-        help="Random seed for grouped splitting and model fitting.",
+        help="Random seed for grouped splitting, Optuna samplers, and model fitting.",
     )
     parser.add_argument(
         "--max-train-rows",
         type=int,
         default=DEFAULT_MAX_TRAIN_ROWS,
-        help="Optional cap on total rows loaded for debugging.",
+        help="Optional cap on aggregated patch rows loaded for debugging.",
     )
     parser.add_argument(
         "--require-existing-embeddings",
@@ -240,9 +331,34 @@ def parse_args() -> argparse.Namespace:
         help="Show tqdm progress while loading embeddings.",
     )
     parser.add_argument(
+        "--plots-dir-name",
+        default=DEFAULT_PLOTS_DIR_NAME,
+        help="Subdirectory under --output-dir used for generated plots.",
+    )
+    parser.add_argument(
+        "--optuna-trials-output-name",
+        default=DEFAULT_OPTUNA_TRIALS_OUTPUT_NAME,
+        help="Filename for the combined Optuna trial table.",
+    )
+    parser.add_argument(
+        "--best-params-output-name",
+        default=DEFAULT_BEST_PARAMS_OUTPUT_NAME,
+        help="Filename for saved best parameter JSON.",
+    )
+    parser.add_argument(
+        "--aggregated-output-name",
+        default=DEFAULT_AGGREGATED_OUTPUT_NAME,
+        help="Filename for the saved aggregated patch-level target table.",
+    )
+    parser.add_argument(
+        "--family-metrics-output-name",
+        default=DEFAULT_FAMILY_METRICS_OUTPUT_NAME,
+        help="Filename for saved family comparison metrics JSON.",
+    )
+    parser.add_argument(
         "--metrics-output-name",
         default=DEFAULT_METRICS_OUTPUT_NAME,
-        help="Filename for saved metrics JSON.",
+        help="Filename for saved summary metrics JSON.",
     )
     parser.add_argument(
         "--config-output-name",
@@ -252,7 +368,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--predictions-output-name",
         default=DEFAULT_PREDICTIONS_OUTPUT_NAME,
-        help="Filename for saved per-row predictions CSV.",
+        help="Filename for saved patch-level predictions CSV.",
     )
     parser.add_argument(
         "--model-output-name",
@@ -288,6 +404,16 @@ def configure_logging(verbose: bool) -> logging.Logger:
     return logger
 
 
+def _import_optuna():
+    try:
+        import optuna
+    except ImportError as exc:
+        raise ImportError(
+            "This script requires Optuna for hyperparameter tuning. Add optuna to the Pixi environment first."
+        ) from exc
+    return optuna
+
+
 def find_repo_root(start: Path | None = None) -> Path | None:
     start_path = (start or Path(__file__).resolve()).resolve()
     for candidate in (start_path, *start_path.parents):
@@ -318,6 +444,17 @@ def read_table(path: Path) -> pd.DataFrame:
     if suffix == ".parquet":
         return pd.read_parquet(path)
     raise ValueError(f"Unsupported input format for {path}. Expected .csv or .parquet.")
+
+
+def write_table(dataframe: pd.DataFrame, path: Path) -> None:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        dataframe.to_csv(path, index=False)
+        return
+    if suffix == ".parquet":
+        dataframe.to_parquet(path, index=False)
+        return
+    raise ValueError(f"Unsupported output format for {path}. Expected .csv or .parquet.")
 
 
 def _import_torch():
@@ -659,6 +796,7 @@ def infer_metadata_columns(
     dataframe: pd.DataFrame,
     *,
     args: argparse.Namespace,
+    continuous_target_col: str,
 ) -> list[str]:
     excluded = {
         args.patch_id_col,
@@ -670,10 +808,27 @@ def infer_metadata_columns(
         args.embedding_format_col,
         args.group_col,
         args.target_col,
+        continuous_target_col,
+        "target_binary",
+        "target_label",
+        "source_row_count",
+        "n_unique_models",
+        "n_models_with_target",
+        "model_names",
         *LEAKAGE_COLUMN_DEFAULTS,
     }
     excluded.update(args.exclude_metadata_cols)
-    inferred = [column for column in dataframe.columns if column not in excluded]
+
+    inferred: list[str] = []
+    for column in dataframe.columns:
+        lowered = column.lower()
+        if column in excluded:
+            continue
+        if any(token in lowered for token in AUTO_METADATA_EXCLUDE_TOKENS):
+            continue
+        if lowered.endswith("_id"):
+            continue
+        inferred.append(column)
     return inferred
 
 
@@ -681,20 +836,20 @@ def check_for_feature_target_leakage(
     *,
     metadata_cols: list[str],
     target_col: str,
-    problem_type: str,
+    continuous_target_col: str,
     logger: logging.Logger,
 ) -> None:
     lowered = {column.lower() for column in metadata_cols}
-    if target_col in metadata_cols:
-        raise ValueError(f"Target column {target_col!r} is included in metadata features. Remove it to prevent leakage.")
-    if problem_type == "classification" and "target_binary" in lowered:
-        raise ValueError("Derived classification label column target_binary would leak into metadata features.")
+    if target_col in metadata_cols or continuous_target_col in metadata_cols:
+        raise ValueError("Target-derived columns are included in metadata features. Remove them to prevent leakage.")
+    if "target_binary" in lowered or "target_label" in lowered:
+        raise ValueError("Derived target label columns would leak into metadata features.")
 
     suspicious = [
         column
         for column in metadata_cols
-        if column.lower() == target_col.lower()
-        or target_col.lower() in column.lower()
+        if target_col.lower() in column.lower()
+        or continuous_target_col.lower() in column.lower()
         or any(token in column.lower() for token in ("pred", "score", "quality", "pq", "dice"))
     ]
     if suspicious:
@@ -715,54 +870,152 @@ def validate_non_missing_core_values(dataframe: pd.DataFrame, *, required_column
             )
 
 
-def filter_rows_with_missing_target(
+def detect_patch_constant_columns(
     dataframe: pd.DataFrame,
     *,
-    target_col: str,
-    model_name_col: str,
+    patch_id_col: str,
+    excluded_columns: set[str],
+) -> list[str]:
+    constant_columns: list[str] = []
+    grouped = dataframe.groupby(patch_id_col, sort=False)
+    for column in dataframe.columns:
+        if column in excluded_columns:
+            continue
+        if grouped[column].nunique(dropna=False).le(1).all():
+            constant_columns.append(column)
+    return constant_columns
+
+
+def aggregate_target_values(series: pd.Series, *, aggregation: str) -> float:
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    if numeric.empty:
+        return float("nan")
+    if aggregation == "median":
+        return float(numeric.median())
+    if aggregation == "mean":
+        return float(numeric.mean())
+    raise ValueError(f"Unsupported aggregation {aggregation!r}.")
+
+
+def aggregate_patch_level_dataset(
+    dataframe: pd.DataFrame,
+    *,
+    args: argparse.Namespace,
     logger: logging.Logger,
-) -> tuple[pd.DataFrame, pd.Series, int]:
-    target_text = dataframe[target_col].astype("string").fillna("").str.strip()
-    y_numeric = pd.to_numeric(dataframe[target_col], errors="coerce")
-    missing_mask = target_text.eq("") | y_numeric.isna()
-    dropped_count = int(missing_mask.sum())
-    if dropped_count == 0:
-        return dataframe, y_numeric, 0
-
-    logger.warning(
-        "Dropping %d row(s) with missing or non-numeric target values in column %r before training.",
-        dropped_count,
-        target_col,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    duplicate_patch_model_mask = dataframe.duplicated(
+        subset=[args.patch_id_col, args.model_name_col],
+        keep=False,
     )
-    if model_name_col in dataframe.columns:
-        dropped_by_model = (
-            dataframe.loc[missing_mask, model_name_col]
-            .astype("string")
-            .fillna("Missing")
-            .value_counts(dropna=False)
-            .sort_index()
-            .to_dict()
-        )
-        logger.warning("Dropped target-missing row counts by model: %s", dropped_by_model)
-
-    filtered = dataframe.loc[~missing_mask].copy()
-    filtered_numeric = y_numeric.loc[~missing_mask].reset_index(drop=True)
-    filtered.reset_index(drop=True, inplace=True)
-
-    if filtered.empty:
+    if duplicate_patch_model_mask.any():
+        duplicate_count = int(duplicate_patch_model_mask.sum())
         raise ValueError(
-            f"All rows were dropped because target column {target_col!r} was missing or non-numeric."
+            f"Joined manifest contains {duplicate_count} duplicate patch_id x model_name row(s). "
+            "Fix the upstream join before training."
         )
-    return filtered, filtered_numeric, dropped_count
+
+    excluded_columns = {args.model_name_col, args.target_col}
+    constant_columns = detect_patch_constant_columns(
+        dataframe,
+        patch_id_col=args.patch_id_col,
+        excluded_columns=excluded_columns,
+    )
+    required_constant_columns = [
+        args.patch_id_col,
+        args.slide_id_col,
+        args.dataset_col,
+        args.group_col,
+    ]
+    if args.feature_mode in {"embedding_only", "embedding_plus_metadata"}:
+        required_constant_columns.append(args.embedding_path_col)
+    if args.embedding_offset_col in dataframe.columns:
+        required_constant_columns.append(args.embedding_offset_col)
+    if args.embedding_format_col in dataframe.columns:
+        required_constant_columns.append(args.embedding_format_col)
+    missing_constant_columns = [
+        column for column in required_constant_columns if column not in constant_columns
+    ]
+    if missing_constant_columns:
+        raise ValueError(
+            "Some required patch-level columns vary across model rows and cannot be aggregated safely: "
+            + ", ".join(repr(column) for column in missing_constant_columns)
+        )
+
+    aggregation_dict = {column: "first" for column in constant_columns if column != args.patch_id_col}
+    aggregated = (
+        dataframe.groupby(args.patch_id_col, sort=False, as_index=False)
+        .agg(aggregation_dict)
+        .copy()
+    )
+
+    target_numeric = pd.to_numeric(dataframe[args.target_col], errors="coerce")
+    target_stats = dataframe[[args.patch_id_col, args.model_name_col]].copy()
+    target_stats["_target_numeric"] = target_numeric
+    grouped_target = target_stats.groupby(args.patch_id_col, sort=False)
+    target_summary = grouped_target.agg(
+        source_row_count=(args.model_name_col, "size"),
+        n_unique_models=(args.model_name_col, "nunique"),
+        n_models_with_target=("_target_numeric", lambda s: int(s.notna().sum())),
+        model_names=(args.model_name_col, lambda s: json.dumps(sorted({str(value) for value in s if pd.notna(value)}))),
+        target_continuous=("_target_numeric", lambda s: aggregate_target_values(s, aggregation=args.target_aggregation)),
+    )
+    aggregated = aggregated.merge(
+        target_summary.reset_index(),
+        on=args.patch_id_col,
+        how="left",
+        validate="one_to_one",
+    )
+
+    expected_model_count = int(
+        dataframe[args.model_name_col].astype("string").fillna("").str.strip().loc[lambda s: s.ne("")].nunique()
+    )
+    dropped_incomplete_patches = 0
+    if args.require_complete_model_coverage:
+        complete_mask = (
+            aggregated["n_unique_models"].eq(expected_model_count)
+            & aggregated["n_models_with_target"].eq(expected_model_count)
+        )
+        dropped_incomplete_patches = int((~complete_mask).sum())
+        if dropped_incomplete_patches:
+            logger.warning(
+                "Dropping %d patch row(s) without complete model coverage (%d expected models).",
+                dropped_incomplete_patches,
+                expected_model_count,
+            )
+        aggregated = aggregated.loc[complete_mask].copy()
+
+    missing_target_mask = aggregated["target_continuous"].isna()
+    dropped_missing_target_patches = int(missing_target_mask.sum())
+    if dropped_missing_target_patches:
+        logger.warning(
+            "Dropping %d aggregated patch row(s) with missing %s target.",
+            dropped_missing_target_patches,
+            args.target_aggregation,
+        )
+        aggregated = aggregated.loc[~missing_target_mask].copy()
+
+    aggregated.reset_index(drop=True, inplace=True)
+    aggregation_stats = {
+        "expected_model_count": expected_model_count,
+        "dropped_incomplete_patch_rows": dropped_incomplete_patches,
+        "dropped_missing_target_patch_rows": dropped_missing_target_patches,
+        "constant_columns": constant_columns,
+    }
+    logger.info(
+        "Aggregated patch-level table has %d row(s) from %d patch x model row(s).",
+        len(aggregated),
+        len(dataframe),
+    )
+    return aggregated, aggregation_stats
 
 
-def build_grouped_split(
+def build_grouped_outer_split(
     dataframe: pd.DataFrame,
     *,
     group_col: str,
     test_size: float,
     random_seed: int,
-) -> TrainSplit:
+) -> OuterSplit:
     if not 0.0 < test_size < 1.0:
         raise ValueError(f"--test-size must be in (0, 1), got {test_size}.")
 
@@ -770,44 +1023,46 @@ def build_grouped_split(
     if np.any(groups == ""):
         raise ValueError(f"Group column {group_col!r} contains missing/blank values.")
 
-    unique_groups = pd.Index(pd.unique(groups))
-    if len(unique_groups) < 2:
-        raise ValueError(
-            f"Need at least two distinct groups in column {group_col!r} for grouped splitting, got {len(unique_groups)}."
-        )
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_seed)
+    train_indices, test_indices = next(splitter.split(dataframe, groups=groups))
 
-    n_test_groups = max(1, int(round(len(unique_groups) * test_size)))
-    if n_test_groups >= len(unique_groups):
-        n_test_groups = len(unique_groups) - 1
-    if n_test_groups <= 0:
-        raise ValueError("Computed zero test groups; increase dataset size or test-size.")
-
-    rng = np.random.default_rng(random_seed)
-    shuffled_groups = unique_groups.to_numpy(copy=True)
-    rng.shuffle(shuffled_groups)
-    test_groups = set(shuffled_groups[:n_test_groups])
-    train_mask = ~pd.Series(groups).isin(test_groups).to_numpy()
-    test_mask = ~train_mask
-
-    train_groups = pd.Series(groups[train_mask]).unique()
-    test_groups_array = pd.Series(groups[test_mask]).unique()
-    overlap = set(train_groups).intersection(set(test_groups_array))
+    train_groups = pd.Series(groups[train_indices]).unique().astype(str)
+    test_groups = pd.Series(groups[test_indices]).unique().astype(str)
+    overlap = set(train_groups).intersection(set(test_groups))
     if overlap:
         raise RuntimeError(
             f"Grouped split leakage detected: {len(overlap)} group(s) appear in both train and test: {sorted(overlap)[:10]}"
         )
 
-    train_indices = np.flatnonzero(train_mask)
-    test_indices = np.flatnonzero(test_mask)
-    if train_indices.size == 0 or test_indices.size == 0:
-        raise ValueError("Grouped split produced an empty train or test set.")
-
-    return TrainSplit(
-        train_indices=train_indices,
-        test_indices=test_indices,
-        train_groups=np.asarray(train_groups),
-        test_groups=np.asarray(test_groups_array),
+    return OuterSplit(
+        train_indices=np.asarray(train_indices, dtype=np.int64),
+        test_indices=np.asarray(test_indices, dtype=np.int64),
+        train_groups=np.asarray(train_groups, dtype=object),
+        test_groups=np.asarray(test_groups, dtype=object),
     )
+
+
+def determine_classification_threshold(train_targets: pd.Series, *, args: argparse.Namespace) -> float:
+    if args.classification_threshold is not None:
+        return float(args.classification_threshold)
+    if args.classification_threshold_strategy == "train_median":
+        return float(pd.to_numeric(train_targets, errors="coerce").median())
+    raise ValueError(
+        "A fixed threshold is required when --classification-threshold-strategy is not train_median."
+    )
+
+
+def build_binary_labels(
+    continuous_target: pd.Series,
+    *,
+    threshold: float,
+    positive_class_name: str,
+) -> pd.Series:
+    if positive_class_name == "failure":
+        labels = continuous_target < threshold
+    else:
+        labels = continuous_target >= threshold
+    return labels.astype(np.int64)
 
 
 def build_feature_dataframe(
@@ -816,88 +1071,6 @@ def build_feature_dataframe(
     metadata_cols: list[str],
 ) -> pd.DataFrame:
     return dataframe[metadata_cols].copy() if metadata_cols else pd.DataFrame(index=dataframe.index)
-
-
-def build_model_pipeline(
-    *,
-    problem_type: str,
-    baseline_name: str,
-    embedding_dim: int,
-    metadata_frame: pd.DataFrame,
-    feature_mode: str,
-    random_seed: int,
-) -> Pipeline:
-    transformers: list[tuple[str, Any, list[str]]] = []
-    if feature_mode in {"embedding_only", "embedding_plus_metadata"}:
-        embedding_cols = [f"emb_{index:04d}" for index in range(embedding_dim)]
-        transformers.append(
-            (
-                "embedding",
-                Pipeline(
-                    steps=[
-                        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-                        ("scaler", StandardScaler()),
-                    ]
-                ),
-                embedding_cols,
-            )
-        )
-
-    if feature_mode in {"metadata_only", "embedding_plus_metadata"} and not metadata_frame.empty:
-        numeric_cols = metadata_frame.select_dtypes(include=[np.number, "bool"]).columns.tolist()
-        categorical_cols = [column for column in metadata_frame.columns if column not in numeric_cols]
-        if numeric_cols:
-            transformers.append(
-                (
-                    "metadata_numeric",
-                    Pipeline(
-                        steps=[
-                            ("imputer", SimpleImputer(strategy="median")),
-                            ("scaler", StandardScaler()),
-                        ]
-                    ),
-                    numeric_cols,
-                )
-            )
-        if categorical_cols:
-            transformers.append(
-                (
-                    "metadata_categorical",
-                    Pipeline(
-                        steps=[
-                            ("imputer", SimpleImputer(strategy="most_frequent")),
-                            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-                        ]
-                    ),
-                    categorical_cols,
-                )
-            )
-
-    if not transformers:
-        raise ValueError("No usable feature transformers were constructed. Check feature mode and metadata columns.")
-
-    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
-
-    if problem_type == "regression":
-        if baseline_name == "dummy_mean":
-            estimator = DummyRegressor(strategy="mean")
-        elif baseline_name == "ridge":
-            estimator = Ridge(alpha=1.0, random_state=random_seed)
-        else:
-            raise ValueError(f"Unsupported regression baseline {baseline_name!r}.")
-    else:
-        if baseline_name == "dummy_most_frequent":
-            estimator = DummyClassifier(strategy="most_frequent")
-        elif baseline_name == "logistic":
-            estimator = LogisticRegression(
-                max_iter=1000,
-                solver="liblinear",
-                random_state=random_seed,
-            )
-        else:
-            raise ValueError(f"Unsupported classification baseline {baseline_name!r}.")
-
-    return Pipeline(steps=[("preprocessor", preprocessor), ("estimator", estimator)])
 
 
 def materialize_training_frame(
@@ -919,30 +1092,525 @@ def materialize_training_frame(
     return pd.concat(frames, axis=1)
 
 
-def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    return {
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-        "rmse": rmse,
-        "r2": float(r2_score(y_true, y_pred)),
-    }
+def get_embedding_columns(feature_frame: pd.DataFrame) -> list[str]:
+    return [column for column in feature_frame.columns if column.startswith("emb_")]
+
+
+def get_metadata_columns(feature_frame: pd.DataFrame) -> list[str]:
+    return [column for column in feature_frame.columns if not column.startswith("emb_")]
+
+
+def sample_classifier_params(
+    trial: Any,
+    *,
+    family: str,
+    feature_mode: str,
+    embedding_dim: int,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"family": family}
+
+    pca_candidates = [value for value in (32, 64, 128, 256, 512) if value < embedding_dim]
+    can_use_pca = feature_mode in {"embedding_only", "embedding_plus_metadata"} and bool(pca_candidates)
+
+    if family == "logistic_regression":
+        params["C"] = trial.suggest_float("C", 1e-3, 50.0, log=True)
+        params["class_weight"] = trial.suggest_categorical("class_weight", [None, "balanced"])
+        params["use_pca"] = trial.suggest_categorical("use_pca", [False, True]) if can_use_pca else False
+        if params["use_pca"]:
+            params["pca_n_components"] = trial.suggest_categorical("pca_n_components", pca_candidates)
+    elif family == "random_forest":
+        params["n_estimators"] = trial.suggest_int("n_estimators", 200, 800, step=100)
+        params["max_depth"] = trial.suggest_categorical("max_depth", [None, 5, 10, 20, 40])
+        params["min_samples_split"] = trial.suggest_int("min_samples_split", 2, 20)
+        params["min_samples_leaf"] = trial.suggest_int("min_samples_leaf", 1, 10)
+        params["max_features"] = trial.suggest_categorical("max_features", ["sqrt", "log2", None, 0.5])
+        params["class_weight"] = trial.suggest_categorical("class_weight", [None, "balanced", "balanced_subsample"])
+    elif family == "svm":
+        params["kernel"] = trial.suggest_categorical("kernel", ["linear", "rbf"])
+        params["C"] = trial.suggest_float("C", 1e-2, 50.0, log=True)
+        params["class_weight"] = trial.suggest_categorical("class_weight", [None, "balanced"])
+        params["use_pca"] = trial.suggest_categorical("use_pca", [False, True]) if can_use_pca else False
+        if params["use_pca"]:
+            params["pca_n_components"] = trial.suggest_categorical("pca_n_components", pca_candidates)
+        if params["kernel"] == "rbf":
+            params["gamma"] = trial.suggest_float("gamma", 1e-5, 1e-1, log=True)
+    else:
+        raise ValueError(f"Unsupported classifier family {family!r}.")
+    return params
+
+
+def build_preprocessor(
+    *,
+    feature_frame: pd.DataFrame,
+    feature_mode: str,
+    family: str,
+    params: dict[str, Any],
+) -> ColumnTransformer:
+    transformers: list[tuple[str, Any, list[str]]] = []
+
+    embedding_cols = get_embedding_columns(feature_frame)
+    metadata_cols = get_metadata_columns(feature_frame)
+    metadata_frame = feature_frame[metadata_cols] if metadata_cols else pd.DataFrame(index=feature_frame.index)
+
+    if feature_mode in {"embedding_only", "embedding_plus_metadata"}:
+        if not embedding_cols:
+            raise ValueError("No embedding columns were found for embedding-based training.")
+        embedding_steps: list[tuple[str, Any]] = [("imputer", SimpleImputer(strategy="constant", fill_value=0.0))]
+        if family in {"logistic_regression", "svm"}:
+            embedding_steps.append(("scaler", StandardScaler()))
+            if params.get("use_pca"):
+                embedding_steps.append(("pca", PCA(n_components=int(params["pca_n_components"]), random_state=0)))
+        transformers.append(("embedding", Pipeline(steps=embedding_steps), embedding_cols))
+
+    if feature_mode in {"metadata_only", "embedding_plus_metadata"} and not metadata_frame.empty:
+        numeric_cols = metadata_frame.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+        categorical_cols = [column for column in metadata_frame.columns if column not in numeric_cols]
+        if numeric_cols:
+            numeric_steps: list[tuple[str, Any]] = [("imputer", SimpleImputer(strategy="median"))]
+            if family in {"logistic_regression", "svm"}:
+                numeric_steps.append(("scaler", StandardScaler()))
+            transformers.append(("metadata_numeric", Pipeline(steps=numeric_steps), numeric_cols))
+        if categorical_cols:
+            categorical_steps: list[tuple[str, Any]] = [
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+            ]
+            transformers.append(("metadata_categorical", Pipeline(steps=categorical_steps), categorical_cols))
+
+    if not transformers:
+        raise ValueError("No usable feature transformers were constructed. Check feature mode and metadata columns.")
+
+    return ColumnTransformer(transformers=transformers, remainder="drop", sparse_threshold=0.0)
+
+
+def build_estimator(
+    *,
+    family: str,
+    params: dict[str, Any],
+    random_seed: int,
+    n_jobs: int,
+) -> Any:
+    if family == "logistic_regression":
+        return LogisticRegression(
+            C=float(params["C"]),
+            class_weight=params["class_weight"],
+            max_iter=2000,
+            solver="lbfgs",
+            random_state=random_seed,
+        )
+    if family == "random_forest":
+        return RandomForestClassifier(
+            n_estimators=int(params["n_estimators"]),
+            max_depth=params["max_depth"],
+            min_samples_split=int(params["min_samples_split"]),
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            max_features=params["max_features"],
+            class_weight=params["class_weight"],
+            random_state=random_seed,
+            n_jobs=n_jobs,
+        )
+    if family == "svm":
+        estimator_kwargs: dict[str, Any] = {
+            "kernel": params["kernel"],
+            "C": float(params["C"]),
+            "class_weight": params["class_weight"],
+            "probability": True,
+            "random_state": random_seed,
+        }
+        if params["kernel"] == "rbf":
+            estimator_kwargs["gamma"] = float(params["gamma"])
+        return SVC(**estimator_kwargs)
+    raise ValueError(f"Unsupported classifier family {family!r}.")
+
+
+def get_positive_class_score(model: Any, X: pd.DataFrame, *, positive_class_value: int = 1) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        probabilities = model.predict_proba(X)
+        classes = getattr(model, "classes_", None)
+        if classes is None:
+            raise RuntimeError("predict_proba is available but classes_ is missing from the estimator.")
+        class_list = list(classes)
+        if positive_class_value not in class_list:
+            raise RuntimeError(f"Positive class value {positive_class_value} is not present in estimator.classes_.")
+        positive_index = class_list.index(positive_class_value)
+        return np.asarray(probabilities[:, positive_index], dtype=np.float64)
+    if hasattr(model, "decision_function"):
+        return np.asarray(model.decision_function(X), dtype=np.float64)
+    raise RuntimeError("Estimator does not support predict_proba or decision_function.")
 
 
 def compute_classification_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     *,
-    y_score: np.ndarray | None,
+    y_score: np.ndarray,
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "classification_report": classification_report(y_true, y_pred, zero_division=0, output_dict=True),
+        "roc_auc": float(roc_auc_score(y_true, y_score)),
+        "average_precision": float(average_precision_score(y_true, y_score)),
+        "log_loss": float(log_loss(y_true, np.clip(y_score, 1e-6, 1.0 - 1e-6))),
+        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
     }
-    if y_score is not None and len(np.unique(y_true)) == 2:
-        metrics["roc_auc"] = float(roc_auc_score(y_true, y_score))
     return metrics
+
+
+def run_optuna_for_family(
+    *,
+    family: str,
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    groups_train: np.ndarray,
+    feature_mode: str,
+    random_seed: int,
+    cv_folds: int,
+    optuna_trials: int,
+    optuna_timeout: int | None,
+    n_jobs: int,
+    plots_dir: Path,
+    logger: logging.Logger,
+) -> tuple[Any, pd.DataFrame]:
+    optuna = _import_optuna()
+
+    if len(np.unique(y_train)) < 2:
+        raise ValueError("Training labels contain only one class; Optuna tuning cannot proceed.")
+    unique_groups = pd.Index(pd.unique(groups_train))
+    if len(unique_groups) < cv_folds:
+        raise ValueError(
+            f"Need at least {cv_folds} distinct groups for grouped CV, got {len(unique_groups)}."
+        )
+
+    sampler = optuna.samplers.TPESampler(seed=random_seed)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=min(5, max(1, optuna_trials // 5)))
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler,
+        pruner=pruner,
+        study_name=f"quality_probe_{family}",
+    )
+
+    embedding_dim = len(get_embedding_columns(X_train))
+    cv = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=random_seed)
+
+    def objective(trial: Any) -> float:
+        params = sample_classifier_params(
+            trial,
+            family=family,
+            feature_mode=feature_mode,
+            embedding_dim=embedding_dim if embedding_dim > 0 else 1,
+        )
+        train_auc_scores: list[float] = []
+        valid_auc_scores: list[float] = []
+        train_loss_scores: list[float] = []
+        valid_loss_scores: list[float] = []
+
+        for fold_index, (inner_train_idx, inner_valid_idx) in enumerate(cv.split(X_train, y_train, groups=groups_train)):
+            X_inner_train = X_train.iloc[inner_train_idx]
+            X_inner_valid = X_train.iloc[inner_valid_idx]
+            y_inner_train = y_train[inner_train_idx]
+            y_inner_valid = y_train[inner_valid_idx]
+
+            if len(np.unique(y_inner_train)) < 2 or len(np.unique(y_inner_valid)) < 2:
+                raise ValueError("A grouped CV fold produced only one class. Reduce cv-folds or adjust the split.")
+
+            preprocessor = build_preprocessor(
+                feature_frame=X_inner_train,
+                feature_mode=feature_mode,
+                family=family,
+                params=params,
+            )
+            estimator = build_estimator(
+                family=family,
+                params=params,
+                random_seed=random_seed,
+                n_jobs=n_jobs,
+            )
+            pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("estimator", estimator)])
+            pipeline.fit(X_inner_train, y_inner_train)
+
+            train_score = get_positive_class_score(pipeline, X_inner_train, positive_class_value=1)
+            valid_score = get_positive_class_score(pipeline, X_inner_valid, positive_class_value=1)
+            train_pred = pipeline.predict(X_inner_train)
+            valid_pred = pipeline.predict(X_inner_valid)
+
+            train_auc_scores.append(float(roc_auc_score(y_inner_train, train_score)))
+            valid_auc_scores.append(float(roc_auc_score(y_inner_valid, valid_score)))
+            train_loss_scores.append(float(log_loss(y_inner_train, np.clip(train_score, 1e-6, 1.0 - 1e-6))))
+            valid_loss_scores.append(float(log_loss(y_inner_valid, np.clip(valid_score, 1e-6, 1.0 - 1e-6))))
+
+            trial.report(float(np.mean(valid_auc_scores)), step=fold_index)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        trial.set_user_attr("family", family)
+        trial.set_user_attr("mean_train_roc_auc", float(np.mean(train_auc_scores)))
+        trial.set_user_attr("mean_valid_roc_auc", float(np.mean(valid_auc_scores)))
+        trial.set_user_attr("std_valid_roc_auc", float(np.std(valid_auc_scores, ddof=0)))
+        trial.set_user_attr("mean_train_log_loss", float(np.mean(train_loss_scores)))
+        trial.set_user_attr("mean_valid_log_loss", float(np.mean(valid_loss_scores)))
+        return float(np.mean(valid_auc_scores))
+
+    logger.info("Starting Optuna study for %s with %d trial(s).", family, optuna_trials)
+    study.optimize(objective, n_trials=optuna_trials, timeout=optuna_timeout, show_progress_bar=False)
+    trials_df = study.trials_dataframe()
+    if "params_family" not in trials_df.columns:
+        trials_df["params_family"] = family
+    trials_df["family"] = family
+
+    save_optuna_family_plots(study=study, trials_df=trials_df, family=family, plots_dir=plots_dir, logger=logger)
+    return study, trials_df
+
+
+def fit_family_pipeline(
+    *,
+    family: str,
+    params: dict[str, Any],
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    random_seed: int,
+    n_jobs: int,
+) -> Pipeline:
+    preprocessor = build_preprocessor(
+        feature_frame=X_train,
+        feature_mode="embedding_plus_metadata" if get_metadata_columns(X_train) and get_embedding_columns(X_train) else (
+            "metadata_only" if get_metadata_columns(X_train) else "embedding_only"
+        ),
+        family=family,
+        params=params,
+    )
+    estimator = build_estimator(
+        family=family,
+        params=params,
+        random_seed=random_seed,
+        n_jobs=n_jobs,
+    )
+    pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("estimator", estimator)])
+    pipeline.fit(X_train, y_train)
+    return pipeline
+
+
+def plot_and_save_figure(fig: plt.Figure, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_optuna_family_plots(
+    *,
+    study: Any,
+    trials_df: pd.DataFrame,
+    family: str,
+    plots_dir: Path,
+    logger: logging.Logger,
+) -> None:
+    optuna = _import_optuna()
+    family_plot_dir = plots_dir / family
+    family_plot_dir.mkdir(parents=True, exist_ok=True)
+
+    complete_trials = trials_df.loc[trials_df["state"] == "COMPLETE"].copy()
+    if complete_trials.empty:
+        logger.warning("No completed Optuna trials were available for %s; skipping Optuna plots.", family)
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    trial_numbers = complete_trials["number"].to_numpy()
+    trial_values = complete_trials["value"].to_numpy(dtype=float)
+    best_so_far = np.maximum.accumulate(trial_values)
+    ax.plot(trial_numbers, trial_values, marker="o", linestyle="-", alpha=0.75, label="validation ROC-AUC")
+    ax.plot(trial_numbers, best_so_far, linestyle="--", linewidth=2.0, label="best so far")
+    ax.set_title(f"{family} optimization history")
+    ax.set_xlabel("trial")
+    ax.set_ylabel("ROC-AUC")
+    ax.legend()
+    plot_and_save_figure(fig, family_plot_dir / "optimization_history.png")
+
+    history_columns = {"user_attrs_mean_train_roc_auc", "user_attrs_mean_valid_roc_auc"}
+    if history_columns.issubset(complete_trials.columns):
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(
+            trial_numbers,
+            complete_trials["user_attrs_mean_train_roc_auc"].to_numpy(dtype=float),
+            marker="o",
+            label="train ROC-AUC",
+        )
+        ax.plot(
+            trial_numbers,
+            complete_trials["user_attrs_mean_valid_roc_auc"].to_numpy(dtype=float),
+            marker="o",
+            label="validation ROC-AUC",
+        )
+        ax.set_title(f"{family} train vs validation ROC-AUC")
+        ax.set_xlabel("trial")
+        ax.set_ylabel("ROC-AUC")
+        ax.legend()
+        plot_and_save_figure(fig, family_plot_dir / "train_validation_auc_history.png")
+
+    loss_columns = {"user_attrs_mean_train_log_loss", "user_attrs_mean_valid_log_loss"}
+    if loss_columns.issubset(complete_trials.columns):
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(
+            trial_numbers,
+            complete_trials["user_attrs_mean_train_log_loss"].to_numpy(dtype=float),
+            marker="o",
+            label="train log loss",
+        )
+        ax.plot(
+            trial_numbers,
+            complete_trials["user_attrs_mean_valid_log_loss"].to_numpy(dtype=float),
+            marker="o",
+            label="validation log loss",
+        )
+        ax.set_title(f"{family} train vs validation log loss")
+        ax.set_xlabel("trial")
+        ax.set_ylabel("log loss")
+        ax.legend()
+        plot_and_save_figure(fig, family_plot_dir / "train_validation_loss_history.png")
+
+    importances = optuna.importance.get_param_importances(study)
+    if importances:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        labels = list(importances.keys())[::-1]
+        values = [importances[label] for label in labels]
+        ax.barh(labels, values)
+        ax.set_title(f"{family} parameter importances")
+        ax.set_xlabel("importance")
+        plot_and_save_figure(fig, family_plot_dir / "param_importances.png")
+
+    param_columns = [column for column in complete_trials.columns if column.startswith("params_")]
+    if param_columns:
+        best_param = param_columns[0]
+        fig, ax = plt.subplots(figsize=(7, 4))
+        x_values = complete_trials[best_param].astype(str)
+        ax.scatter(x_values, complete_trials["value"].to_numpy(dtype=float), alpha=0.75)
+        ax.set_title(f"{family} score vs {best_param.removeprefix('params_')}")
+        ax.set_xlabel(best_param.removeprefix("params_"))
+        ax.set_ylabel("ROC-AUC")
+        ax.tick_params(axis="x", rotation=45)
+        plot_and_save_figure(fig, family_plot_dir / "score_vs_primary_param.png")
+
+
+def save_confusion_matrix_plot(
+    *,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    path: Path,
+    title: str,
+    negative_class_name: str,
+    positive_class_name: str,
+) -> None:
+    matrix = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    image = ax.imshow(matrix, cmap="Blues")
+    fig.colorbar(image, ax=ax)
+    ax.set_xticks([0, 1], labels=[negative_class_name, positive_class_name])
+    ax.set_yticks([0, 1], labels=[negative_class_name, positive_class_name])
+    ax.set_xlabel("predicted")
+    ax.set_ylabel("true")
+    ax.set_title(title)
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            ax.text(j, i, str(matrix[i, j]), ha="center", va="center")
+    plot_and_save_figure(fig, path)
+
+
+def save_roc_curve_plot(
+    *,
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    path: Path,
+    title: str,
+) -> None:
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    auc_value = roc_auc_score(y_true, y_score)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.plot(fpr, tpr, label=f"ROC-AUC = {auc_value:.3f}")
+    ax.plot([0, 1], [0, 1], linestyle="--", color="grey")
+    ax.set_xlabel("false positive rate")
+    ax.set_ylabel("true positive rate")
+    ax.set_title(title)
+    ax.legend(loc="lower right")
+    plot_and_save_figure(fig, path)
+
+
+def save_precision_recall_curve_plot(
+    *,
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    path: Path,
+    title: str,
+) -> None:
+    precision, recall, _ = precision_recall_curve(y_true, y_score)
+    average_precision = average_precision_score(y_true, y_score)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.plot(recall, precision, label=f"AP = {average_precision:.3f}")
+    ax.set_xlabel("recall")
+    ax.set_ylabel("precision")
+    ax.set_title(title)
+    ax.legend(loc="lower left")
+    plot_and_save_figure(fig, path)
+
+
+def save_learning_curve_plot(
+    *,
+    family: str,
+    best_params: dict[str, Any],
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    groups_train: np.ndarray,
+    feature_mode: str,
+    random_seed: int,
+    cv_folds: int,
+    n_jobs: int,
+    path: Path,
+    logger: logging.Logger,
+) -> None:
+    if len(np.unique(y_train)) < 2:
+        logger.warning("Skipping learning-curve plot because the training labels contain only one class.")
+        return
+
+    try:
+        cv = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=random_seed)
+        preprocessor = build_preprocessor(
+            feature_frame=X_train,
+            feature_mode=feature_mode,
+            family=family,
+            params=best_params,
+        )
+        estimator = build_estimator(
+            family=family,
+            params=best_params,
+            random_seed=random_seed,
+            n_jobs=n_jobs,
+        )
+        pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("estimator", estimator)])
+
+        train_sizes, train_scores, valid_scores = learning_curve(
+            pipeline,
+            X_train,
+            y_train,
+            groups=groups_train,
+            cv=cv,
+            scoring="roc_auc",
+            train_sizes=np.linspace(0.2, 1.0, 5),
+            n_jobs=1,
+        )
+    except Exception as exc:
+        logger.warning("Skipping learning-curve plot for %s because it failed: %s", family, exc)
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(train_sizes, train_scores.mean(axis=1), marker="o", label="train ROC-AUC")
+    ax.plot(train_sizes, valid_scores.mean(axis=1), marker="o", label="validation ROC-AUC")
+    ax.set_xlabel("training rows")
+    ax.set_ylabel("ROC-AUC")
+    ax.set_title(f"{family} learning curve")
+    ax.legend()
+    plot_and_save_figure(fig, path)
 
 
 def serialize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -950,6 +1618,13 @@ def serialize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     for key, value in metrics.items():
         if isinstance(value, dict):
             serializable[key] = serialize_metrics(value)
+        elif isinstance(value, list):
+            serializable[key] = [
+                serialize_metrics(item) if isinstance(item, dict) else (
+                    item.item() if isinstance(item, (np.floating, np.integer)) else item
+                )
+                for item in value
+            ]
         elif isinstance(value, (np.floating, np.integer)):
             serializable[key] = value.item()
         else:
@@ -960,6 +1635,7 @@ def serialize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
 def main() -> int:
     args = parse_args()
     logger = configure_logging(args.verbose)
+    _import_optuna()
 
     repo_root = resolve_repo_root(args.repo_root)
     input_path = resolve_cli_path(args.input, repo_root=repo_root)
@@ -970,46 +1646,46 @@ def main() -> int:
 
     logger.info("Reading joined manifest: %s", input_path)
     dataframe = read_table(input_path)
-    if args.max_train_rows is not None:
-        dataframe = dataframe.head(args.max_train_rows).copy()
-        logger.info("Applied row limit: %d row(s).", len(dataframe))
-
     required_columns = [
         args.patch_id_col,
         args.slide_id_col,
         args.dataset_col,
         args.model_name_col,
-        args.embedding_path_col,
         args.group_col,
         args.target_col,
     ]
+    if args.feature_mode in {"embedding_only", "embedding_plus_metadata"}:
+        required_columns.append(args.embedding_path_col)
     validate_required_columns(dataframe, required_columns, context="Joined manifest")
-    dataframe, y_regression, dropped_target_rows = filter_rows_with_missing_target(
-        dataframe,
-        target_col=args.target_col,
-        model_name_col=args.model_name_col,
-        logger=logger,
-    )
     validate_non_missing_core_values(
         dataframe,
         required_columns=[
             args.patch_id_col,
             args.slide_id_col,
             args.dataset_col,
-            args.model_name_col,
-            args.embedding_path_col,
             args.group_col,
         ],
     )
 
+    aggregated, aggregation_stats = aggregate_patch_level_dataset(dataframe, args=args, logger=logger)
+    if args.max_train_rows is not None:
+        aggregated = aggregated.head(args.max_train_rows).copy()
+        logger.info("Applied aggregated patch row limit: %d row(s).", len(aggregated))
+
+    if aggregated.empty:
+        raise RuntimeError("No aggregated patch rows were available after preprocessing.")
+
     if args.feature_mode not in FEATURE_MODES:
         raise ValueError(f"Unsupported feature mode {args.feature_mode!r}.")
-    if args.problem_type not in PROBLEM_TYPES:
-        raise ValueError(f"Unsupported problem type {args.problem_type!r}.")
 
+    continuous_target_col = "target_continuous"
     explicit_metadata_cols = [column for column in args.metadata_cols if column]
     if args.auto_metadata_cols:
-        inferred_metadata_cols = infer_metadata_columns(dataframe, args=args)
+        inferred_metadata_cols = infer_metadata_columns(
+            aggregated,
+            args=args,
+            continuous_target_col=continuous_target_col,
+        )
         metadata_cols = list(dict.fromkeys(explicit_metadata_cols + inferred_metadata_cols))
     else:
         metadata_cols = explicit_metadata_cols
@@ -1018,27 +1694,22 @@ def main() -> int:
         raise ValueError(
             "Metadata features are required for this feature mode. Supply --metadata-cols or enable --auto-metadata-cols."
         )
-    validate_required_columns(dataframe, metadata_cols, context="Joined manifest metadata features")
+    validate_required_columns(aggregated, metadata_cols, context="Aggregated patch metadata features")
     check_for_feature_target_leakage(
         metadata_cols=metadata_cols,
         target_col=args.target_col,
-        problem_type=args.problem_type,
+        continuous_target_col=continuous_target_col,
         logger=logger,
     )
 
     logger.info("Using feature mode %s.", args.feature_mode)
     logger.info("Using metadata columns: %s", metadata_cols)
 
-    metadata_frame = build_feature_dataframe(dataframe, metadata_cols=metadata_cols)
-
+    metadata_frame = build_feature_dataframe(aggregated, metadata_cols=metadata_cols)
     embedding_matrix: np.ndarray | None = None
     if args.feature_mode in {"embedding_only", "embedding_plus_metadata"}:
-        if args.embedding_path_col not in dataframe.columns:
-            raise ValueError(
-                f"Feature mode {args.feature_mode!r} requires column {args.embedding_path_col!r} to load embeddings."
-            )
         embedding_matrix, loaded_indices = load_embedding_matrix(
-            dataframe,
+            aggregated,
             input_path=input_path,
             repo_root=repo_root,
             embedding_path_col=args.embedding_path_col,
@@ -1048,78 +1719,254 @@ def main() -> int:
             show_progress=args.progress,
             logger=logger,
         )
-        if loaded_indices != list(dataframe.index):
-            raise RuntimeError("Embedding load order drift detected; loaded row indices do not match the manifest order.")
+        if loaded_indices != list(aggregated.index):
+            raise RuntimeError("Embedding load order drift detected; loaded row indices do not match the aggregated table.")
 
-    X = materialize_training_frame(
+    feature_frame = materialize_training_frame(
         embedding_matrix=embedding_matrix,
         metadata_frame=metadata_frame,
         feature_mode=args.feature_mode,
     )
-
-    split = build_grouped_split(
-        dataframe,
+    split = build_grouped_outer_split(
+        aggregated,
         group_col=args.group_col,
         test_size=args.test_size,
         random_seed=args.random_seed,
     )
-    logger.info(
-        "Grouped split complete: train_rows=%d test_rows=%d train_groups=%d test_groups=%d.",
-        len(split.train_indices),
-        len(split.test_indices),
-        len(split.train_groups),
-        len(split.test_groups),
-    )
 
-    baseline_name = (
-        "ridge" if args.problem_type == "regression" else "logistic"
+    train_continuous_target = aggregated.loc[split.train_indices, continuous_target_col]
+    threshold = determine_classification_threshold(train_continuous_target, args=args)
+    negative_class_name = "quality" if args.positive_class_name == "failure" else "failure"
+    aggregated["target_binary"] = build_binary_labels(
+        aggregated[continuous_target_col],
+        threshold=threshold,
+        positive_class_name=args.positive_class_name,
     )
-    logger.info("Training baseline model: %s", baseline_name)
+    aggregated["target_label"] = aggregated["target_binary"].map({1: args.positive_class_name, 0: negative_class_name})
+    aggregated["split"] = "train"
+    aggregated.loc[split.test_indices, "split"] = "test"
 
-    if args.problem_type == "regression":
-        y = y_regression.to_numpy(dtype=np.float32)
-    else:
-        threshold = args.classification_threshold
-        if not 0.0 <= threshold <= 1.0:
-            raise ValueError(f"--classification-threshold must be in [0, 1], got {threshold}.")
-        y = (y_regression.to_numpy(dtype=np.float32) >= threshold).astype(np.int64)
-        class_values = np.unique(y)
-        if class_values.size < 2:
-            raise ValueError(
-                f"Classification target derived from {args.target_col!r} at threshold {threshold} "
-                f"has only one class: {class_values.tolist()}."
+    y_binary = aggregated["target_binary"].to_numpy(dtype=np.int64)
+    y_train = y_binary[split.train_indices]
+    y_test = y_binary[split.test_indices]
+    if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
+        raise ValueError("Outer grouped split produced only one class in train or test. Adjust the split settings.")
+
+    X_train = feature_frame.iloc[split.train_indices].reset_index(drop=True)
+    X_test = feature_frame.iloc[split.test_indices].reset_index(drop=True)
+    groups_train = aggregated.iloc[split.train_indices][args.group_col].astype(str).to_numpy()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir = output_dir / args.plots_dir_name
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    all_trials: list[pd.DataFrame] = []
+    family_metrics_summary: dict[str, Any] = {}
+    best_params_by_family: dict[str, dict[str, Any]] = {}
+    failed_families: dict[str, str] = {}
+
+    for family in args.classifier_families:
+        try:
+            study, trials_df = run_optuna_for_family(
+                family=family,
+                X_train=X_train,
+                y_train=y_train,
+                groups_train=groups_train,
+                feature_mode=args.feature_mode,
+                random_seed=args.random_seed,
+                cv_folds=args.cv_folds,
+                optuna_trials=args.optuna_trials,
+                optuna_timeout=args.optuna_timeout,
+                n_jobs=args.n_jobs,
+                plots_dir=plots_dir,
+                logger=logger,
+            )
+            trials_df["selected_threshold"] = threshold
+            all_trials.append(trials_df)
+
+            best_trial = study.best_trial
+            raw_params = dict(best_trial.params)
+            best_params_by_family[family] = raw_params.copy()
+
+            family_pipeline = fit_family_pipeline(
+                family=family,
+                params={"family": family, **raw_params},
+                X_train=X_train,
+                y_train=y_train,
+                random_seed=args.random_seed,
+                n_jobs=args.n_jobs,
             )
 
-    pipeline = build_model_pipeline(
-        problem_type=args.problem_type,
-        baseline_name=baseline_name,
-        embedding_dim=0 if embedding_matrix is None else embedding_matrix.shape[1],
-        metadata_frame=metadata_frame,
-        feature_mode=args.feature_mode,
+            train_score = get_positive_class_score(family_pipeline, X_train, positive_class_value=1)
+            test_score = get_positive_class_score(family_pipeline, X_test, positive_class_value=1)
+            train_pred = family_pipeline.predict(X_train)
+            test_pred = family_pipeline.predict(X_test)
+
+            family_metrics_summary[family] = {
+                "status": "ok",
+                "best_cv_roc_auc": float(study.best_value),
+                "best_params": raw_params,
+                "train_metrics": compute_classification_metrics(y_train, train_pred, y_score=train_score),
+                "test_metrics": compute_classification_metrics(y_test, test_pred, y_score=test_score),
+            }
+        except Exception as exc:
+            failed_families[family] = str(exc)
+            logger.exception("Classifier family %s failed during tuning or evaluation.", family)
+            family_metrics_summary[family] = {
+                "status": "failed",
+                "failure_reason": str(exc),
+            }
+
+    if not best_params_by_family:
+        raise RuntimeError("All classifier families failed during tuning. Check the logged errors and input data.")
+
+    combined_trials = pd.concat(all_trials, ignore_index=True) if all_trials else pd.DataFrame()
+    trials_output_path = output_dir / args.optuna_trials_output_name
+    if not combined_trials.empty:
+        logger.info("Writing Optuna trials: %s", trials_output_path)
+        combined_trials.to_csv(trials_output_path, index=False)
+
+    best_params_output_path = output_dir / args.best_params_output_name
+    family_metrics_output_path = output_dir / args.family_metrics_output_name
+    best_params_output_path.write_text(json.dumps(best_params_by_family, indent=2, sort_keys=True) + "\n")
+    family_metrics_output_path.write_text(json.dumps(serialize_metrics(family_metrics_summary), indent=2, sort_keys=True) + "\n")
+
+    selected_family = max(
+        (
+            (family, metrics)
+            for family, metrics in family_metrics_summary.items()
+            if metrics.get("status") == "ok"
+        ),
+        key=lambda item: item[1]["best_cv_roc_auc"],
+    )[0]
+    selected_params = {"family": selected_family, **best_params_by_family[selected_family]}
+    selected_pipeline_eval = fit_family_pipeline(
+        family=selected_family,
+        params=selected_params,
+        X_train=X_train,
+        y_train=y_train,
         random_seed=args.random_seed,
+        n_jobs=args.n_jobs,
     )
 
-    X_train = X.iloc[split.train_indices]
-    X_test = X.iloc[split.test_indices]
-    y_train = y[split.train_indices]
-    y_test = y[split.test_indices]
+    train_score = get_positive_class_score(selected_pipeline_eval, X_train, positive_class_value=1)
+    test_score = get_positive_class_score(selected_pipeline_eval, X_test, positive_class_value=1)
+    train_pred = selected_pipeline_eval.predict(X_train)
+    test_pred = selected_pipeline_eval.predict(X_test)
 
-    pipeline.fit(X_train, y_train)
-    estimator = pipeline.named_steps["estimator"]
-    preprocessor = pipeline.named_steps["preprocessor"]
+    test_plot_dir = plots_dir / selected_family
+    save_confusion_matrix_plot(
+        y_true=y_test,
+        y_pred=test_pred,
+        path=test_plot_dir / "confusion_matrix_test.png",
+        title=f"{selected_family} test confusion matrix",
+        negative_class_name=negative_class_name,
+        positive_class_name=args.positive_class_name,
+    )
+    save_roc_curve_plot(
+        y_true=y_test,
+        y_score=test_score,
+        path=test_plot_dir / "roc_curve_test.png",
+        title=f"{selected_family} test ROC curve",
+    )
+    save_precision_recall_curve_plot(
+        y_true=y_test,
+        y_score=test_score,
+        path=test_plot_dir / "precision_recall_curve_test.png",
+        title=f"{selected_family} test precision-recall curve",
+    )
+    save_learning_curve_plot(
+        family=selected_family,
+        best_params=selected_params,
+        X_train=X_train,
+        y_train=y_train,
+        groups_train=groups_train,
+        feature_mode=args.feature_mode,
+        random_seed=args.random_seed,
+        cv_folds=args.cv_folds,
+        n_jobs=args.n_jobs,
+        path=test_plot_dir / "learning_curve_roc_auc.png",
+        logger=logger,
+    )
 
-    train_pred = pipeline.predict(X_train)
-    test_pred = pipeline.predict(X_test)
+    predictions_df = aggregated.copy()
+    predictions_df["target"] = predictions_df["target_binary"].astype(np.int64)
+    predictions_df["prediction"] = pd.Series(pd.NA, index=predictions_df.index, dtype="Int64")
+    predictions_df["prediction_score"] = np.nan
+    predictions_df["predicted_failure_label"] = pd.Series(pd.NA, index=predictions_df.index, dtype="Int64")
+    predictions_df["predicted_failure_probability"] = np.nan
+    predictions_df["predicted_quality_label"] = pd.Series(pd.NA, index=predictions_df.index, dtype="Int64")
+    predictions_df["predicted_quality_probability"] = np.nan
+    predictions_df["selected_classifier_family"] = selected_family
+    predictions_df["classification_threshold"] = threshold
 
-    metrics: dict[str, Any] = {
+    predictions_df.loc[predictions_df.index[split.train_indices], "prediction"] = train_pred
+    predictions_df.loc[predictions_df.index[split.test_indices], "prediction"] = test_pred
+    predictions_df.loc[predictions_df.index[split.train_indices], "prediction_score"] = train_score
+    predictions_df.loc[predictions_df.index[split.test_indices], "prediction_score"] = test_score
+    if args.positive_class_name == "failure":
+        predictions_df.loc[predictions_df.index[split.train_indices], "predicted_failure_label"] = train_pred
+        predictions_df.loc[predictions_df.index[split.test_indices], "predicted_failure_label"] = test_pred
+        predictions_df.loc[predictions_df.index[split.train_indices], "predicted_failure_probability"] = train_score
+        predictions_df.loc[predictions_df.index[split.test_indices], "predicted_failure_probability"] = test_score
+        predictions_df["predicted_quality_probability"] = 1.0 - predictions_df["predicted_failure_probability"]
+        predictions_df["predicted_quality_label"] = (1 - predictions_df["predicted_failure_label"]).astype("Int64")
+    else:
+        predictions_df.loc[predictions_df.index[split.train_indices], "predicted_quality_label"] = train_pred
+        predictions_df.loc[predictions_df.index[split.test_indices], "predicted_quality_label"] = test_pred
+        predictions_df.loc[predictions_df.index[split.train_indices], "predicted_quality_probability"] = train_score
+        predictions_df.loc[predictions_df.index[split.test_indices], "predicted_quality_probability"] = test_score
+        predictions_df["predicted_failure_probability"] = 1.0 - predictions_df["predicted_quality_probability"]
+        predictions_df["predicted_failure_label"] = (1 - predictions_df["predicted_quality_label"]).astype("Int64")
+
+    aggregated_output_path = output_dir / args.aggregated_output_name
+    logger.info("Writing aggregated patch targets: %s", aggregated_output_path)
+    write_table(predictions_df, aggregated_output_path)
+
+    predictions_output_path = output_dir / args.predictions_output_name
+    logger.info("Writing predictions: %s", predictions_output_path)
+    predictions_df.to_csv(predictions_output_path, index=False)
+
+    final_training_pipeline = fit_family_pipeline(
+        family=selected_family,
+        params=selected_params,
+        X_train=feature_frame.reset_index(drop=True),
+        y_train=y_binary,
+        random_seed=args.random_seed,
+        n_jobs=args.n_jobs,
+    )
+    estimator = final_training_pipeline.named_steps["estimator"]
+    preprocessor = final_training_pipeline.named_steps["preprocessor"]
+
+    model_output_path = output_dir / args.model_output_name
+    scaler_output_path = output_dir / args.scaler_output_name
+    logger.info("Writing predictor: %s", model_output_path)
+    with model_output_path.open("wb") as handle:
+        pickle.dump(estimator, handle)
+    logger.info("Writing preprocessor/scaler: %s", scaler_output_path)
+    with scaler_output_path.open("wb") as handle:
+        pickle.dump(preprocessor, handle)
+
+    selected_train_metrics = compute_classification_metrics(y_train, train_pred, y_score=train_score)
+    selected_test_metrics = compute_classification_metrics(y_test, test_pred, y_score=test_score)
+
+    metrics_payload: dict[str, Any] = {
         "problem_type": args.problem_type,
-        "baseline_name": baseline_name,
         "feature_mode": args.feature_mode,
         "target_col": args.target_col,
+        "target_aggregation": args.target_aggregation,
+        "aggregated_target_col": continuous_target_col,
         "group_col": args.group_col,
-        "classification_threshold": args.classification_threshold if args.problem_type == "classification" else None,
-        "n_rows": int(len(dataframe)),
-        "n_dropped_missing_target_rows": int(dropped_target_rows),
+        "positive_class_name": args.positive_class_name,
+        "positive_class_value": 1,
+        "negative_class_name": negative_class_name,
+        "classification_threshold_strategy": args.classification_threshold_strategy,
+        "classification_threshold": threshold,
+        "expected_model_count": aggregation_stats["expected_model_count"],
+        "dropped_incomplete_patch_rows": aggregation_stats["dropped_incomplete_patch_rows"],
+        "dropped_missing_target_patch_rows": aggregation_stats["dropped_missing_target_patch_rows"],
+        "n_raw_rows": int(len(dataframe)),
+        "n_rows": int(len(aggregated)),
         "n_train_rows": int(len(split.train_indices)),
         "n_test_rows": int(len(split.test_indices)),
         "n_train_groups": int(len(split.train_groups)),
@@ -1128,32 +1975,22 @@ def main() -> int:
         "test_groups": split.test_groups.tolist(),
         "metadata_cols": metadata_cols,
         "embedding_dim": None if embedding_matrix is None else int(embedding_matrix.shape[1]),
+        "classifier_families": args.classifier_families,
+        "selected_classifier_family": selected_family,
+        "selected_best_cv_roc_auc": family_metrics_summary[selected_family]["best_cv_roc_auc"],
+        "candidate_family_summary": {
+            family: {
+                "status": family_metrics_summary[family]["status"],
+                "best_cv_roc_auc": family_metrics_summary[family].get("best_cv_roc_auc"),
+                "test_roc_auc": family_metrics_summary[family].get("test_metrics", {}).get("roc_auc"),
+                "test_balanced_accuracy": family_metrics_summary[family].get("test_metrics", {}).get("balanced_accuracy"),
+                "failure_reason": family_metrics_summary[family].get("failure_reason"),
+            }
+            for family in family_metrics_summary
+        },
+        "train_metrics": selected_train_metrics,
+        "test_metrics": selected_test_metrics,
     }
-
-    predictions_df = dataframe.copy()
-    predictions_df["split"] = "train"
-    predictions_df.loc[predictions_df.index[split.test_indices], "split"] = "test"
-    predictions_df["target"] = y if args.problem_type == "classification" else y_regression.to_numpy(dtype=np.float32)
-    predictions_df["prediction"] = np.nan
-    predictions_df.loc[predictions_df.index[split.train_indices], "prediction"] = train_pred
-    predictions_df.loc[predictions_df.index[split.test_indices], "prediction"] = test_pred
-
-    if args.problem_type == "regression":
-        metrics["train_metrics"] = compute_regression_metrics(y_train, train_pred)
-        metrics["test_metrics"] = compute_regression_metrics(y_test, test_pred)
-    else:
-        train_score = None
-        test_score = None
-        if hasattr(pipeline, "predict_proba"):
-            train_score = pipeline.predict_proba(X_train)[:, 1]
-            test_score = pipeline.predict_proba(X_test)[:, 1]
-            predictions_df["prediction_score"] = np.nan
-            predictions_df.loc[predictions_df.index[split.train_indices], "prediction_score"] = train_score
-            predictions_df.loc[predictions_df.index[split.test_indices], "prediction_score"] = test_score
-        metrics["train_metrics"] = compute_classification_metrics(y_train, train_pred, y_score=train_score)
-        metrics["test_metrics"] = compute_classification_metrics(y_test, test_pred, y_score=test_score)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     config_payload = {
         key: value
@@ -1165,35 +2002,34 @@ def main() -> int:
             "input": str(input_path),
             "output_dir": str(output_dir),
             "repo_root": None if repo_root is None else str(repo_root),
-            "baseline_name": baseline_name,
-            "n_dropped_missing_target_rows": int(dropped_target_rows),
+            "problem_type": args.problem_type,
+            "aggregated_target_col": continuous_target_col,
+            "classification_threshold": threshold,
+            "positive_class_name": args.positive_class_name,
+            "positive_class_value": 1,
+            "negative_class_name": negative_class_name,
+            "selected_classifier_family": selected_family,
+            "selected_best_params": best_params_by_family[selected_family],
+            "failed_classifier_families": failed_families,
+            "expected_model_count": aggregation_stats["expected_model_count"],
+            "metadata_cols": metadata_cols,
+            "embedding_dim": None if embedding_matrix is None else int(embedding_matrix.shape[1]),
             "train_groups": split.train_groups.tolist(),
             "test_groups": split.test_groups.tolist(),
+            "plots_dir": str(plots_dir),
+            "aggregated_output_path": str(aggregated_output_path),
+            "trials_output_path": str(trials_output_path),
+            "best_params_output_path": str(best_params_output_path),
+            "family_metrics_output_path": str(family_metrics_output_path),
         }
     )
 
-    model_output_path = output_dir / args.model_output_name
-    scaler_output_path = output_dir / args.scaler_output_name
     config_output_path = output_dir / args.config_output_name
     metrics_output_path = output_dir / args.metrics_output_name
-    predictions_output_path = output_dir / args.predictions_output_name
-
-    logger.info("Writing predictor: %s", model_output_path)
-    with model_output_path.open("wb") as handle:
-        pickle.dump(estimator, handle)
-
-    logger.info("Writing preprocessor/scaler: %s", scaler_output_path)
-    with scaler_output_path.open("wb") as handle:
-        pickle.dump(preprocessor, handle)
-
     logger.info("Writing config: %s", config_output_path)
     config_output_path.write_text(json.dumps(config_payload, indent=2, sort_keys=True) + "\n")
-
     logger.info("Writing metrics: %s", metrics_output_path)
-    metrics_output_path.write_text(json.dumps(serialize_metrics(metrics), indent=2, sort_keys=True) + "\n")
-
-    logger.info("Writing predictions: %s", predictions_output_path)
-    predictions_df.to_csv(predictions_output_path, index=False)
+    metrics_output_path.write_text(json.dumps(serialize_metrics(metrics_payload), indent=2, sort_keys=True) + "\n")
 
     logger.info("Done.")
     return 0

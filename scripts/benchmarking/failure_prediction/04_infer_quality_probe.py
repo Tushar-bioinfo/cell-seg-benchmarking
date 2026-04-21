@@ -654,34 +654,61 @@ def main() -> int:
     prediction_table["artifact_dir"] = str(artifact_dir)
     prediction_table["feature_mode"] = feature_mode
     prediction_table["problem_type"] = problem_type
+    if "selected_classifier_family" in config:
+        prediction_table["selected_classifier_family"] = config["selected_classifier_family"]
+    if "classification_threshold" in config:
+        prediction_table["classification_threshold"] = config["classification_threshold"]
 
     if problem_type == "regression":
         predicted_quality = estimator.predict(X_transformed)
         prediction_table["predicted_quality_score"] = np.asarray(predicted_quality, dtype=np.float64)
     else:
-        predicted_label = estimator.predict(X_transformed)
-        prediction_table["predicted_quality_label"] = np.asarray(predicted_label, dtype=np.int64)
+        predicted_label = np.asarray(estimator.predict(X_transformed), dtype=np.int64)
+        positive_class_name = str(config.get("positive_class_name", "quality"))
+        negative_class_name = str(
+            config.get("negative_class_name", "failure" if positive_class_name == "quality" else "quality")
+        )
+        positive_class_value = int(config.get("positive_class_value", 1))
 
         if hasattr(estimator, "predict_proba"):
             probabilities = estimator.predict_proba(X_transformed)
-            if probabilities.ndim != 2 or probabilities.shape[1] < 2:
+            classes = getattr(estimator, "classes_", None)
+            if classes is None:
+                raise RuntimeError("Saved classification estimator exposes predict_proba but not classes_.")
+            classes = list(classes)
+            if positive_class_value not in classes:
                 raise RuntimeError(
-                    f"Expected binary classification probabilities with shape [n, 2], got {probabilities.shape}."
+                    f"Saved classification estimator does not contain positive class value {positive_class_value!r}."
                 )
-            positive_quality_probability = probabilities[:, 1]
+            positive_index = classes.index(positive_class_value)
+            if probabilities.ndim != 2 or probabilities.shape[1] <= positive_index:
+                raise RuntimeError(
+                    f"Expected binary classification probabilities with a positive-class column, got {probabilities.shape}."
+                )
+            positive_probability = np.asarray(probabilities[:, positive_index], dtype=np.float64)
         else:
             raise RuntimeError(
                 "Saved classification estimator does not support predict_proba, so failure probability cannot be computed."
             )
 
-        prediction_table["predicted_quality_probability"] = np.asarray(
-            positive_quality_probability,
-            dtype=np.float64,
-        )
-        prediction_table["predicted_failure_probability"] = np.asarray(
-            1.0 - positive_quality_probability,
-            dtype=np.float64,
-        )
+        prediction_table["positive_class_name"] = positive_class_name
+        prediction_table["negative_class_name"] = negative_class_name
+
+        if positive_class_name == "failure":
+            failure_probability = positive_probability
+            failure_label = (predicted_label == positive_class_value).astype(np.int64)
+            quality_probability = 1.0 - failure_probability
+            quality_label = 1 - failure_label
+        else:
+            quality_probability = positive_probability
+            quality_label = (predicted_label == positive_class_value).astype(np.int64)
+            failure_probability = 1.0 - quality_probability
+            failure_label = 1 - quality_label
+
+        prediction_table["predicted_failure_label"] = np.asarray(failure_label, dtype=np.int64)
+        prediction_table["predicted_failure_probability"] = np.asarray(failure_probability, dtype=np.float64)
+        prediction_table["predicted_quality_label"] = np.asarray(quality_label, dtype=np.int64)
+        prediction_table["predicted_quality_probability"] = np.asarray(quality_probability, dtype=np.float64)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Writing inference predictions: %s", output_path)
