@@ -268,11 +268,23 @@ def summarize_artifact_dir(
 
 def summarize_inference_table(path: Path) -> dict[str, Any]:
     table = read_table(path)
+    recorded_artifact_dir: str | None = None
+    if "artifact_dir" in table.columns:
+        artifact_values = (
+            table["artifact_dir"].astype("string").fillna("").str.strip().loc[lambda series: series.ne("")]
+        )
+        unique_artifact_values = pd.Index(pd.unique(artifact_values))
+        if len(unique_artifact_values) == 1:
+            recorded_artifact_dir = str(unique_artifact_values[0])
+
     summary: dict[str, Any] = {
         "summary_type": "inference",
+        "artifact_dir": str(path.parent.resolve()),
         "inference_table": str(path),
         "inference.n_rows": int(len(table)),
     }
+    if recorded_artifact_dir is not None:
+        summary["inference.recorded_artifact_dir"] = recorded_artifact_dir
 
     numeric_columns = [
         column
@@ -300,6 +312,10 @@ def summarize_inference_table(path: Path) -> dict[str, Any]:
     return summary
 
 
+def normalize_artifact_key(path_like: str | Path) -> str:
+    return str(Path(path_like).expanduser().resolve())
+
+
 def main() -> int:
     args = parse_args()
     logger = configure_logging(args.verbose)
@@ -316,24 +332,38 @@ def main() -> int:
         raise ValueError("Provide at least one artifact directory or inference table to summarize.")
 
     summary_rows: list[dict[str, Any]] = []
+    artifact_row_by_key: dict[str, dict[str, Any]] = {}
 
     for artifact_dir in artifact_dirs:
         logger.info("Summarizing artifact directory: %s", artifact_dir)
-        summary_rows.append(
-            summarize_artifact_dir(
-                artifact_dir,
-                config_name=args.config_name,
-                metrics_name=args.metrics_name,
-                predictions_name=args.predictions_name,
-            )
+        row = summarize_artifact_dir(
+            artifact_dir,
+            config_name=args.config_name,
+            metrics_name=args.metrics_name,
+            predictions_name=args.predictions_name,
         )
+        summary_rows.append(row)
+        artifact_row_by_key[normalize_artifact_key(row["artifact_dir"])] = row
 
     for inference_table in args.inference_tables:
         resolved_table = resolve_cli_path(inference_table, repo_root=repo_root)
         logger.info("Summarizing inference table: %s", resolved_table)
         if not resolved_table.exists():
             raise FileNotFoundError(f"Inference table does not exist: {resolved_table}")
-        summary_rows.append(summarize_inference_table(resolved_table))
+        inference_row = summarize_inference_table(resolved_table)
+        artifact_key = normalize_artifact_key(inference_row["artifact_dir"])
+        if artifact_key in artifact_row_by_key:
+            artifact_row = artifact_row_by_key[artifact_key]
+            artifact_row.update(
+                {
+                    key: value
+                    for key, value in inference_row.items()
+                    if key not in {"summary_type", "artifact_dir"}
+                }
+            )
+            artifact_row["summary_type"] = "artifact_inference"
+        else:
+            summary_rows.append(inference_row)
 
     if not summary_rows:
         raise RuntimeError("No summary rows were produced.")

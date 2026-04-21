@@ -21,6 +21,11 @@ DEFAULT_MANIFEST_DATASET_COL = "dataset"
 DEFAULT_MANIFEST_SPLIT_COL = "split"
 DEFAULT_MANIFEST_EMBEDDING_PATH_COL = "embedding_path"
 DEFAULT_MANIFEST_JOIN_COL = "patch_id"
+AUTO_MANIFEST_PASSTHROUGH_COLS = (
+    "embedding_row_offset",
+    "embedding_format",
+    "embedding_dim",
+)
 
 DEFAULT_EVAL_JOIN_COL = "auto"
 DEFAULT_EVAL_MODEL_COL = "model_name"
@@ -483,6 +488,13 @@ def build_manifest_base(dataframe: pd.DataFrame, args: argparse.Namespace, logge
             args.manifest_join_col,
         }
     ]
+    for column in AUTO_MANIFEST_PASSTHROUGH_COLS:
+        if (
+            column in dataframe.columns
+            and column not in manifest.columns
+            and column not in extra_cols
+        ):
+            extra_cols.append(column)
     for column in extra_cols:
         manifest[column] = dataframe[column]
 
