@@ -490,21 +490,28 @@ def resolve_embedding_path(
         return resolved
 
     candidate_roots: list[Path] = []
-    for candidate in (input_path.parent, repo_root, Path.cwd()):
+    for candidate in (repo_root, input_path.parent, Path.cwd()):
         if candidate is None:
             continue
         resolved_root = candidate.resolve()
         if resolved_root not in candidate_roots:
             candidate_roots.append(resolved_root)
 
-    attempted: list[str] = []
+    attempted_paths: list[Path] = []
     for root in candidate_roots:
         candidate_path = (root / path).resolve(strict=False)
-        attempted.append(str(candidate_path))
-        if not require_existing_embeddings or candidate_path.exists():
+        attempted_paths.append(candidate_path)
+        if candidate_path.exists():
             return candidate_path
 
-    raise FileNotFoundError(f"Could not resolve embedding path {text!r}. Tried: {attempted}")
+    if require_existing_embeddings:
+        raise FileNotFoundError(
+            f"Could not resolve embedding path {text!r}. Tried: {[str(candidate) for candidate in attempted_paths]}"
+        )
+
+    if attempted_paths:
+        return attempted_paths[0]
+    raise FileNotFoundError(f"Could not resolve embedding path {text!r}; no candidate roots were available.")
 
 
 def normalize_optional_int(value: object, *, column_name: str, row_context: str) -> int | None:
