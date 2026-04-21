@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -62,6 +63,14 @@ def parse_args() -> argparse.Namespace:
         help="Input column mapped to output column slide_id.",
     )
     parser.add_argument(
+        "--slide-id-source-col",
+        default=None,
+        help=(
+            "Optional source column used to derive slide_id. "
+            "Defaults to --slide-id-col when not provided."
+        ),
+    )
+    parser.add_argument(
         "--dataset-col",
         default=DEFAULT_DATASET_COL,
         help="Input column mapped to output column dataset. Ignored when --dataset-value is provided.",
@@ -77,6 +86,11 @@ def parse_args() -> argparse.Namespace:
         help="Input column mapped to output column embedding_path.",
     )
     parser.add_argument(
+        "--slide-id-value",
+        default=None,
+        help="Constant value to write to output column slide_id instead of reading an input column.",
+    )
+    parser.add_argument(
         "--dataset-value",
         default=None,
         help="Constant value to write to output column dataset instead of reading an input column.",
@@ -85,6 +99,24 @@ def parse_args() -> argparse.Namespace:
         "--split-value",
         default=None,
         help="Constant value to write to output column split instead of reading an input column.",
+    )
+    parser.add_argument(
+        "--slide-id-strip-prefix",
+        default="",
+        help="Optional prefix stripped from slide_id values after reading the source column.",
+    )
+    parser.add_argument(
+        "--slide-id-strip-suffix",
+        default="",
+        help="Optional suffix stripped from slide_id values after reading the source column.",
+    )
+    parser.add_argument(
+        "--slide-id-strip-regex",
+        default="",
+        help=(
+            "Optional regex pattern removed from slide_id values using re.sub(pattern, '', value). "
+            "Useful for converting patch IDs into slide IDs."
+        ),
     )
     parser.add_argument(
         "--extra-cols",
@@ -203,6 +235,25 @@ def validate_required_output_values(dataframe: pd.DataFrame, required_columns: l
                 f"Output column {column!r} contains {missing_count} missing/blank value(s). "
                 "Fix the source table or supply a CLI mapping/value override."
             )
+
+
+def derive_slide_id(dataframe: pd.DataFrame, args: argparse.Namespace) -> pd.Series:
+    if args.slide_id_value is not None:
+        return pd.Series(args.slide_id_value, index=dataframe.index, dtype="object")
+
+    source_col = args.slide_id_source_col or args.slide_id_col
+    series = dataframe[source_col].astype("object").where(dataframe[source_col].notna(), "")
+    derived = series.astype(str).str.strip()
+
+    if args.slide_id_strip_prefix:
+        derived = derived.str.removeprefix(args.slide_id_strip_prefix)
+    if args.slide_id_strip_suffix:
+        derived = derived.str.removesuffix(args.slide_id_strip_suffix)
+    if args.slide_id_strip_regex:
+        pattern = re.compile(args.slide_id_strip_regex)
+        derived = derived.map(lambda value: pattern.sub("", value))
+
+    return derived
 
 
 def build_candidate_roots(
@@ -341,7 +392,7 @@ def deduplicate_by_patch_id(
 def build_manifest(dataframe: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     manifest = pd.DataFrame(index=dataframe.index)
     manifest["patch_id"] = dataframe[args.patch_id_col]
-    manifest["slide_id"] = dataframe[args.slide_id_col]
+    manifest["slide_id"] = derive_slide_id(dataframe, args)
     manifest["dataset"] = args.dataset_value if args.dataset_value is not None else dataframe[args.dataset_col]
     manifest["split"] = args.split_value if args.split_value is not None else dataframe[args.split_col]
     manifest["embedding_path"] = dataframe[args.embedding_path_col]
@@ -384,7 +435,9 @@ def main() -> int:
     dataframe = read_table(input_path)
     logger.info("Loaded %d row(s) x %d column(s).", len(dataframe), len(dataframe.columns))
 
-    required_source_columns = [args.patch_id_col, args.slide_id_col, args.embedding_path_col]
+    required_source_columns = [args.patch_id_col, args.embedding_path_col]
+    if args.slide_id_value is None:
+        required_source_columns.append(args.slide_id_source_col or args.slide_id_col)
     if args.dataset_value is None:
         required_source_columns.append(args.dataset_col)
     if args.split_value is None:
