@@ -28,4 +28,4 @@ logs/*
 outputs/*
 
 # Except CSV files
-!outputs/*.csv
+!outputs/**/*.csv
