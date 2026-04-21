@@ -25,7 +25,6 @@ tmp/*
 
 logs/*
 
-outputs/*
-
-# Except CSV files
+outputs/**
+!outputs/**/
 !outputs/**/*.csv
