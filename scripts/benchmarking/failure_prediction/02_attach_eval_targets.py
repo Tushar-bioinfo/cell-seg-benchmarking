@@ -22,10 +22,24 @@ DEFAULT_MANIFEST_SPLIT_COL = "split"
 DEFAULT_MANIFEST_EMBEDDING_PATH_COL = "embedding_path"
 DEFAULT_MANIFEST_JOIN_COL = "patch_id"
 
-DEFAULT_EVAL_JOIN_COL = "patch_id"
+DEFAULT_EVAL_JOIN_COL = "auto"
 DEFAULT_EVAL_MODEL_COL = "model_name"
 DEFAULT_STATUS_COL = "status"
 DEFAULT_TARGET_METRICS = ("instance_pq", "pixel_dice")
+AUTO_EVAL_JOIN_COLUMN_CANDIDATES = (
+    "patch_id",
+    "image_id",
+    "match_key",
+    "relative_image_path",
+    "image_path",
+    "pred_relative_path",
+    "pred_file_name",
+    "relative_mask_path",
+    "gt_relative_path",
+    "gt_file_name",
+    "pred_path",
+    "gt_path",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,7 +140,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-join-col",
         default=DEFAULT_EVAL_JOIN_COL,
-        help="Evaluation column used to join back to the patch manifest.",
+        help=(
+            "Evaluation column used to join back to the patch manifest. "
+            "Use 'auto' to detect common evaluation identifiers such as patch_id or image_id."
+        ),
     )
     parser.add_argument(
         "--eval-model-col",
@@ -282,6 +299,84 @@ def normalize_join_series(
     if strip_suffix:
         normalized = normalized.str.removesuffix(strip_suffix)
     return normalized
+
+
+def build_auto_join_variants(series: pd.Series) -> list[tuple[str, pd.Series]]:
+    normalized = series.astype("string").fillna("").str.strip()
+    basename = normalized.map(lambda value: Path(value).name if value else value)
+    stem = basename.str.replace(r"\.[^.]+$", "", regex=True)
+    stripped_role = stem.str.replace(r"_(image|mask|class_labels)$", "", regex=True)
+    return [
+        ("raw", normalized),
+        ("basename", basename),
+        ("basename_stem", stem),
+        ("basename_strip_role", stripped_role),
+    ]
+
+
+def select_eval_join_strategy(
+    dataframe: pd.DataFrame,
+    *,
+    configured_join_col: str,
+    manifest_keys: set[str],
+    logger: logging.Logger,
+    eval_path: Path,
+    model_name: str,
+) -> tuple[str, pd.Series, str]:
+    if configured_join_col != "auto":
+        if configured_join_col not in dataframe.columns:
+            raise ValueError(
+                f"Evaluation file {eval_path.name} is missing required columns: {configured_join_col!r}"
+            )
+        return configured_join_col, dataframe[configured_join_col], "manual"
+
+    candidate_columns = [column for column in AUTO_EVAL_JOIN_COLUMN_CANDIDATES if column in dataframe.columns]
+    if not candidate_columns:
+        raise ValueError(
+            f"Evaluation file {eval_path.name} does not contain any supported auto join columns: "
+            + ", ".join(repr(column) for column in AUTO_EVAL_JOIN_COLUMN_CANDIDATES)
+        )
+
+    best_column: str | None = None
+    best_variant_name = ""
+    best_series: pd.Series | None = None
+    best_match_count = -1
+    best_non_blank_count = -1
+
+    for column in candidate_columns:
+        for variant_name, variant_series in build_auto_join_variants(dataframe[column]):
+            non_blank = variant_series.loc[variant_series.ne("")]
+            unique_values = pd.Index(non_blank.unique())
+            match_count = int(unique_values.isin(manifest_keys).sum())
+            non_blank_count = len(unique_values)
+            if match_count > best_match_count or (
+                match_count == best_match_count and non_blank_count > best_non_blank_count
+            ):
+                best_column = column
+                best_variant_name = variant_name
+                best_series = variant_series
+                best_match_count = match_count
+                best_non_blank_count = non_blank_count
+
+    assert best_column is not None
+    assert best_series is not None
+
+    if best_match_count <= 0:
+        raise ValueError(
+            f"Could not auto-detect a usable evaluation join column for model {model_name} from {eval_path.name}. "
+            "Pass --eval-join-col explicitly if your evaluation schema differs."
+        )
+
+    logger.info(
+        "Model %s from %s: auto-selected evaluation join column %r with strategy %s "
+        "(matched %d unique key(s)).",
+        model_name,
+        eval_path.name,
+        best_column,
+        best_variant_name,
+        best_match_count,
+    )
+    return best_column, best_series, best_variant_name
 
 
 def resolve_eval_paths(
@@ -451,10 +546,9 @@ def process_eval_group(
     args: argparse.Namespace,
     logger: logging.Logger,
 ) -> pd.DataFrame:
-    required_eval_columns = [args.eval_join_col, *args.target_metrics]
     validate_required_columns(
         eval_group,
-        required_eval_columns + [column for column in args.eval_extra_cols if column],
+        [*args.target_metrics, *[column for column in args.eval_extra_cols if column]],
         context=f"Evaluation file {eval_path.name}",
     )
 
@@ -479,17 +573,29 @@ def process_eval_group(
             args.status_col,
         )
 
-    filtered["_join_key"] = normalize_join_series(
-        filtered[args.eval_join_col],
-        use_basename=args.eval_join_basename,
-        strip_prefix=args.eval_join_strip_prefix,
-        strip_suffix=args.eval_join_strip_suffix,
+    eval_join_col, auto_join_series, join_strategy = select_eval_join_strategy(
+        filtered,
+        configured_join_col=args.eval_join_col,
+        manifest_keys=set(manifest_base["_join_key"]),
+        logger=logger,
+        eval_path=eval_path,
+        model_name=model_name,
     )
+    if join_strategy == "manual":
+        filtered["_join_key"] = normalize_join_series(
+            auto_join_series,
+            use_basename=args.eval_join_basename,
+            strip_prefix=args.eval_join_strip_prefix,
+            strip_suffix=args.eval_join_strip_suffix,
+        )
+    else:
+        filtered["_join_key"] = auto_join_series
 
     blank_join_mask = filtered["_join_key"].eq("")
     if blank_join_mask.any():
         raise ValueError(
-            f"Model {model_name} from {eval_path.name} produced {int(blank_join_mask.sum())} blank join key(s)."
+            f"Model {model_name} from {eval_path.name} produced {int(blank_join_mask.sum())} blank join key(s) "
+            f"from evaluation column {eval_join_col!r}."
         )
 
     filtered = deduplicate_eval_rows(
@@ -504,7 +610,7 @@ def process_eval_group(
     extra_cols = [
         column
         for column in args.eval_extra_cols
-        if column not in {args.eval_join_col, args.eval_model_col, args.status_col, *args.target_metrics}
+        if column not in {eval_join_col, args.eval_model_col, args.status_col, *args.target_metrics}
     ]
     eval_keep_cols.extend(extra_cols)
     eval_subset = filtered[eval_keep_cols].copy()
