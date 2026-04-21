@@ -14,9 +14,14 @@ Scripts:
 Build a canonical patch manifest:
 
 ```bash
-pixi run -e default python scripts/benchmarking/failure_prediction/01_build_patch_manifest.py \
-  --input outputs/conic_liz/embeddings/metadata/embeddings_index.parquet \
-  --output outputs/conic_liz/failure_prediction/patch_manifest.parquet
+`01_build_patch_manifest.py` accepts the following arguments:
+- `--input`: path to the embeddings index parquet file
+- `--output`: path to write the patch manifest parquet file
+- `--patch-id-col`: column to use as patch ID (e.g. `sample_id`)
+- `--slide-id-col`: column to use as slide ID (e.g. `sample_id`)
+- `--dataset-value`: dataset label to assign (e.g. `conic_liz`)
+- `--split-value`: split label to assign (e.g. `all`)
+- `--extra-cols`: additional columns to carry through (e.g. `sample_id conic_index image_path mask_path class_label_path resolved_image_path embedding_row_offset embedding_format embedding_dim`)
 ```
 
 Attach evaluation targets:
