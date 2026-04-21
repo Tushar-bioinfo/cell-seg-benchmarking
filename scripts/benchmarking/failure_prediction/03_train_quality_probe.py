@@ -708,6 +708,47 @@ def validate_non_missing_core_values(dataframe: pd.DataFrame, *, required_column
             )
 
 
+def filter_rows_with_missing_target(
+    dataframe: pd.DataFrame,
+    *,
+    target_col: str,
+    model_name_col: str,
+    logger: logging.Logger,
+) -> tuple[pd.DataFrame, pd.Series, int]:
+    target_text = dataframe[target_col].astype("string").fillna("").str.strip()
+    y_numeric = pd.to_numeric(dataframe[target_col], errors="coerce")
+    missing_mask = target_text.eq("") | y_numeric.isna()
+    dropped_count = int(missing_mask.sum())
+    if dropped_count == 0:
+        return dataframe, y_numeric, 0
+
+    logger.warning(
+        "Dropping %d row(s) with missing or non-numeric target values in column %r before training.",
+        dropped_count,
+        target_col,
+    )
+    if model_name_col in dataframe.columns:
+        dropped_by_model = (
+            dataframe.loc[missing_mask, model_name_col]
+            .astype("string")
+            .fillna("Missing")
+            .value_counts(dropna=False)
+            .sort_index()
+            .to_dict()
+        )
+        logger.warning("Dropped target-missing row counts by model: %s", dropped_by_model)
+
+    filtered = dataframe.loc[~missing_mask].copy()
+    filtered_numeric = y_numeric.loc[~missing_mask].reset_index(drop=True)
+    filtered.reset_index(drop=True, inplace=True)
+
+    if filtered.empty:
+        raise ValueError(
+            f"All rows were dropped because target column {target_col!r} was missing or non-numeric."
+        )
+    return filtered, filtered_numeric, dropped_count
+
+
 def build_grouped_split(
     dataframe: pd.DataFrame,
     *,
@@ -936,6 +977,12 @@ def main() -> int:
         args.target_col,
     ]
     validate_required_columns(dataframe, required_columns, context="Joined manifest")
+    dataframe, y_regression, dropped_target_rows = filter_rows_with_missing_target(
+        dataframe,
+        target_col=args.target_col,
+        model_name_col=args.model_name_col,
+        logger=logger,
+    )
     validate_non_missing_core_values(
         dataframe,
         required_columns=[
@@ -945,7 +992,6 @@ def main() -> int:
             args.model_name_col,
             args.embedding_path_col,
             args.group_col,
-            args.target_col,
         ],
     )
 
@@ -975,13 +1021,6 @@ def main() -> int:
 
     logger.info("Using feature mode %s.", args.feature_mode)
     logger.info("Using metadata columns: %s", metadata_cols)
-
-    y_regression = pd.to_numeric(dataframe[args.target_col], errors="coerce")
-    if y_regression.isna().any():
-        missing_count = int(y_regression.isna().sum())
-        raise ValueError(
-            f"Target column {args.target_col!r} contains {missing_count} non-numeric or missing value(s)."
-        )
 
     metadata_frame = build_feature_dataframe(dataframe, metadata_cols=metadata_cols)
 
@@ -1073,6 +1112,7 @@ def main() -> int:
         "group_col": args.group_col,
         "classification_threshold": args.classification_threshold if args.problem_type == "classification" else None,
         "n_rows": int(len(dataframe)),
+        "n_dropped_missing_target_rows": int(dropped_target_rows),
         "n_train_rows": int(len(split.train_indices)),
         "n_test_rows": int(len(split.test_indices)),
         "n_train_groups": int(len(split.train_groups)),
@@ -1119,6 +1159,7 @@ def main() -> int:
             "output_dir": str(output_dir),
             "repo_root": None if repo_root is None else str(repo_root),
             "baseline_name": baseline_name,
+            "n_dropped_missing_target_rows": int(dropped_target_rows),
             "train_groups": split.train_groups.tolist(),
             "test_groups": split.test_groups.tolist(),
         }
