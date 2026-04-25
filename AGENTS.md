@@ -4,11 +4,14 @@
 
 - Do not read all docs by default.
 - Start with headings only: `rg -n "^## " docs/*.md`.
+- For project-overview questions, read `docs/project_summary.md` first, then open only the lower-level docs you need.
 - Read only the file and section needed for the task.
 - Treat `docs/` as the repo source of truth. Read scripts directly only to implement or verify behavior.
 
 ## Use These Sources
 
+- `docs/project_summary.md`
+  Use for the current project-level framing, summary date/version, active milestones, and how benchmarking, embeddings, and difficulty prediction fit together.
 - `docs/monu_context.md`
   Use for MoNuSAC export, rescaling, tiling, dataset roots, manifests, join keys, and naming rules.
 - `docs/conic_context.md`
