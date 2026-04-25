@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=model-workflow
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=12:00:00
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=130G
+#SBATCH --time=24:00:00
 #SBATCH --output=model-workflow-%j.out
 #SBATCH --error=model-workflow-%j.out
 
@@ -27,7 +27,7 @@ MODEL_ROOT="${MODEL_ROOT:-outputs/conic_liz/model}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-baseline}"
 EXPERIMENT_DIR="${EXPERIMENT_DIR:-${MODEL_ROOT}/experiments/${EXPERIMENT_NAME}}"
 
-PREP_JOINED_TARGET_TABLE="${PREP_JOINED_TARGET_TABLE:-tmp/extra/outputs_22_04_26/conic_liz/failure_prediction/patch_manifest_with_eval_targets.parquet}"
+PREP_JOINED_TARGET_TABLE="${PREP_JOINED_TARGET_TABLE:-outputs/conic_liz/failure_prediction/patch_manifest_with_eval_targets.parquet}"
 PREP_EMBEDDINGS_INDEX="${PREP_EMBEDDINGS_INDEX:-}"
 PREP_EMBED_MORPH="${PREP_EMBED_MORPH:-outputs/conic_liz/embed_morph.csv}"
 PREP_PATCH_FEATURES="${PREP_PATCH_FEATURES:-}"

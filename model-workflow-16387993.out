@@ -1,0 +1,46 @@
+[model_workflow_slurm] project_root=/share/lab_teng/trainee/tusharsingh/cell-seg
+[model_workflow_slurm] run_prep=1
+[model_workflow_slurm] run_main=1
+[model_workflow_slurm] run_report=1
+[model_workflow_slurm] run_failure=1
+[model_workflow_slurm] run_summary=1
+[model_workflow_slurm] model_root=outputs/conic_liz/model
+[model_workflow_slurm] experiment_name=embed_plus_meta
+[model_workflow_slurm] experiment_dir=outputs/conic_liz/model/experiments/embed_plus_meta
+[model_workflow_slurm] model_table_output=outputs/conic_liz/model/experiments/embed_plus_meta/model_table/modeling_table.csv.gz
+[model_workflow_slurm] main_output_dir=outputs/conic_liz/model/experiments/embed_plus_meta/main_model
+[model_workflow_slurm] report_output_dir=outputs/conic_liz/model/experiments/embed_plus_meta/report_model
+[model_workflow_slurm] failure_output_dir=outputs/conic_liz/model/experiments/embed_plus_meta/failure_mode
+[model_workflow_slurm] summary_output_dir=outputs/conic_liz/model/experiments/embed_plus_meta/summary
+[model_workflow_slurm] common_n_jobs=24
+[model_workflow_slurm] host=hpctpa3pc0001
+[model_workflow_slurm] date=Fri Apr 24 23:56:04 EDT 2026
+[model_workflow_slurm] python=Python 3.9.20
+[model_workflow_slurm] pixi=pixi 0.65.0
+[model_workflow_slurm] slurm_job_id=16387993
+[model_workflow_slurm] command=pixi run -e default python scripts/benchmarking/model/01_build_model_table.py --joined-target-table outputs/conic_liz/failure_prediction/patch_manifest_with_eval_targets.parquet --patch-id-col patch_id --slide-id-col slide_id --output outputs/conic_liz/model/experiments/embed_plus_meta/model_table/modeling_table.csv.gz --embed-morph outputs/conic_liz/embed_morph.csv 
+2026-04-24 23:56:12 | INFO | stage=build_model_table output_dir=/share/lab_teng/trainee/tusharsingh/cell-seg/outputs/conic_liz/model/experiments/embed_plus_meta/model_table
+2026-04-24 23:56:14 | INFO | joined source=embed_morph rows=4981 new_columns=36 overlap_columns=4
+2026-04-24 23:56:14 | INFO | wrote modeling table rows=4981 columns=51 path=/share/lab_teng/trainee/tusharsingh/cell-seg/outputs/conic_liz/model/experiments/embed_plus_meta/model_table/modeling_table.csv.gz
+[model_workflow_slurm] command=pixi run -e default python scripts/benchmarking/model/02_train_main_model.py --input-table outputs/conic_liz/model/experiments/embed_plus_meta/model_table/modeling_table.csv.gz --output-dir outputs/conic_liz/model/experiments/embed_plus_meta/main_model --target-col pq_median --feature-set embedding_plus_metadata --model-families ridge svr random_forest --group-col slide_id --test-size 0.2 --cv-folds 5 --optuna-trials 40 --optuna-timeout 600 --n-jobs 24 --random-seed 42 --metadata-cols foreground_fraction mean_area dominant_fraction 
+2026-04-24 23:56:17 | INFO | stage=main_model output_dir=/share/lab_teng/trainee/tusharsingh/cell-seg/outputs/conic_liz/model/experiments/embed_plus_meta/main_model
+2026-04-24 23:56:18 | INFO | rows=4981 dropped_missing_target=0 feature_set=embedding_plus_metadata metadata_cols=3 model_families=['ridge', 'svr', 'random_forest']
+/share/lab_teng/trainee/tusharsingh/cell-seg/scripts/benchmarking/model/_common.py:997: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  tensor_like = torch.load(path, map_location="cpu")
+/share/lab_teng/trainee/tusharsingh/cell-seg/scripts/benchmarking/model/_common.py:997: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  tensor_like = torch.load(path, map_location="cpu")
+Traceback (most recent call last):
+  File "/share/lab_teng/trainee/tusharsingh/cell-seg/scripts/benchmarking/model/02_train_main_model.py", line 415, in <module>
+    main()
+  File "/share/lab_teng/trainee/tusharsingh/cell-seg/scripts/benchmarking/model/02_train_main_model.py", line 249, in main
+    metrics = regression_metrics(y_test, predictions)
+  File "/share/lab_teng/trainee/tusharsingh/cell-seg/scripts/benchmarking/model/_common.py", line 486, in regression_metrics
+    "rmse": float(mean_squared_error(observed, predicted, squared=False)),
+  File "/share/lab_teng/trainee/tusharsingh/cell-seg/.pixi/envs/default/lib/python3.10/site-packages/sklearn/utils/_param_validation.py", line 194, in wrapper
+    params = func_sig.bind(*args, **kwargs)
+  File "/share/lab_teng/trainee/tusharsingh/cell-seg/.pixi/envs/default/lib/python3.10/inspect.py", line 3186, in bind
+    return self._bind(args, kwargs)
+  File "/share/lab_teng/trainee/tusharsingh/cell-seg/.pixi/envs/default/lib/python3.10/inspect.py", line 3175, in _bind
+    raise TypeError(
+TypeError: got an unexpected keyword argument 'squared'
+srun: error: hpctpa3pc0001: task 0: Exited with exit code 1

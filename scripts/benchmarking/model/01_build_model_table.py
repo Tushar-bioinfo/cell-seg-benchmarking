@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--joined-target-table",
-        default="tmp/extra/outputs_22_04_26/conic_liz/failure_prediction/patch_manifest_with_eval_targets.parquet",
+        default="outputs/conic_liz/failure_prediction/patch_manifest_with_eval_targets.parquet",
         help="Patch-by-model target table with evaluation metrics.",
     )
     parser.add_argument(
