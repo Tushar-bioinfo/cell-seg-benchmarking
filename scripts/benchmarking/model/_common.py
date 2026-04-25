@@ -481,9 +481,10 @@ def regression_metrics(y_true: Sequence[float], y_pred: Sequence[float]) -> dict
 
     observed = np.asarray(y_true, dtype=float)
     predicted = np.asarray(y_pred, dtype=float)
+    mse = float(mean_squared_error(observed, predicted))
     metrics: dict[str, float | None] = {
         "mae": float(mean_absolute_error(observed, predicted)),
-        "rmse": float(mean_squared_error(observed, predicted, squared=False)),
+        "rmse": float(np.sqrt(mse)),
         "r2": float(r2_score(observed, predicted)),
     }
     if len(np.unique(observed)) > 1 and len(observed) > 1:
