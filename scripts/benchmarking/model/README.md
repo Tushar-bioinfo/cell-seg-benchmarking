@@ -90,7 +90,8 @@ Important current contract:
 Important data caveat:
 
 - The failure-mode stage requires consensus columns for `rq_median`, `sq_median`, `pixel_precision_median`, and `pixel_recall_median`
-- If the upstream joined target table does not expose those metrics, `04_train_failure_mode_model.py` will stop with a clear missing-column error instead of guessing
+- When `RUN_FAILURE=1`, the prep stage now requests those metrics explicitly and can auto-enrich the joined target table from `*_evaluation.csv` files under `outputs/conic_liz/`
+- If the joined target table still cannot provide those metrics after enrichment, prep fails early with a clear error instead of letting `04_train_failure_mode_model.py` fail later
 
 ## Step 01: Build Model Table
 
@@ -105,6 +106,7 @@ Reads:
 - Optional `--embeddings-index`
 - Optional `--embed-morph`
 - Optional `--patch-features`
+- Optional evaluation CSVs via `--eval-dir`, `--eval-glob`, and `--eval-files` when missing metrics must be reattached
 
 Writes:
 - `modeling_table.csv.gz`
@@ -121,6 +123,11 @@ Important CLI arguments:
 - `--patch-features`
 - `--patch-id-col`
 - `--slide-id-col`
+- `--required-consensus-metrics`
+- `--auto-enrich-missing-metrics`
+- `--eval-dir`
+- `--eval-glob`
+- `--eval-files`
 - `--output`
 
 What it derives:
@@ -139,13 +146,16 @@ Example command:
 ```bash
 pixi run -e default python scripts/benchmarking/model/01_build_model_table.py \
   --joined-target-table tmp/extra/outputs_22_04_26/conic_liz/failure_prediction/patch_manifest_with_eval_targets.parquet \
+  --required-consensus-metrics pq rq sq pixel_precision pixel_recall \
+  --auto-enrich-missing-metrics \
+  --eval-dir outputs/conic_liz \
   --embed-morph outputs/conic_liz/embed_morph.csv \
   --output outputs/conic_liz/model/experiments/baseline/model_table/modeling_table.csv.gz
 ```
 
 Expected artifacts:
 - `modeling_table.csv.gz`
-- validation reports describing row counts, discovered metrics, optional joins, duplicate checks, and missingness
+- validation reports describing row counts, discovered metrics, optional joins, duplicate checks, missingness, and whether evaluation CSV enrichment was used
 
 ## Step 02: Train Main Model
 
@@ -465,6 +475,12 @@ The wrapper `run_model_workflow.slurm` mirrors the existing failure-prediction s
 - `RUN_FAILURE`
 - `RUN_SUMMARY`
 - `EXPERIMENT_NAME`
+
+Failure-mode-related prep defaults:
+
+- When `RUN_FAILURE=1`, the wrapper automatically sets `PREP_REQUIRED_CONSENSUS_METRICS="pq rq sq pixel_precision pixel_recall"`
+- When `RUN_FAILURE=1`, the wrapper also enables `PREP_AUTO_ENRICH_MISSING_METRICS=1`
+- Evaluation CSV discovery defaults to `PREP_EVAL_DIR=outputs/conic_liz` and `PREP_EVAL_GLOB=*_evaluation.csv`
 
 Default named run:
 

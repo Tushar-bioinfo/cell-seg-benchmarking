@@ -138,8 +138,8 @@ NON_FEATURE_COLUMNS.update(REPORTED_TARGET_COLUMNS)
 
 METRIC_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "pq": ("pq", "instance_pq", "panoptic_quality"),
-    "rq": ("rq", "recognition_quality"),
-    "sq": ("sq", "segmentation_quality"),
+    "rq": ("rq", "instance_rq", "recognition_quality"),
+    "sq": ("sq", "instance_sq", "segmentation_quality"),
     "pixel_precision": ("pixel_precision", "precision"),
     "pixel_recall": ("pixel_recall", "recall"),
 }
@@ -995,7 +995,10 @@ class EmbeddingStoreCache:
             raise ImportError(
                 f"Embedding file {path} requires torch for `.pt` loading, but torch is unavailable: {exc}"
             ) from exc
-        tensor_like = torch.load(path, map_location="cpu")
+        try:
+            tensor_like = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            tensor_like = torch.load(path, map_location="cpu")
         if hasattr(tensor_like, "detach"):
             return tensor_like.detach().cpu().numpy()
         if isinstance(tensor_like, np.ndarray):
@@ -1213,7 +1216,6 @@ def make_classification_estimator(
             C=float(params["C"]),
             class_weight=params["class_weight"],
             max_iter=2000,
-            multi_class="auto",
             n_jobs=n_jobs,
             random_state=random_seed,
         )

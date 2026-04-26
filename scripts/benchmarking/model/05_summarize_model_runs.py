@@ -230,21 +230,36 @@ def main() -> None:
 
     required_artifact_rows: list[dict] = []
     discovered_asset_rows: list[dict] = []
+    available_stage_dirs: dict[str, Path] = {}
+    skipped_stage_rows: list[dict] = []
     for stage_name, stage_dir in stage_dirs.items():
         if not stage_dir.exists():
-            raise FileNotFoundError(f"Requested stage directory does not exist: {stage_dir}")
+            skipped_stage_rows.append(
+                {
+                    "stage_name": stage_name,
+                    "reason": "stage_dir_missing",
+                    "path": str(stage_dir),
+                }
+            )
+            continue
         stage_rows = stage_artifact_table(stage_name, stage_dir)
         missing_rows = [row for row in stage_rows if not row["exists"]]
         if missing_rows:
             raise FileNotFoundError(
                 f"Stage `{stage_name}` is missing required artifacts: {missing_rows}"
             )
+        available_stage_dirs[stage_name] = stage_dir
         required_artifact_rows.extend(stage_rows)
         discovered_asset_rows.extend(collect_stage_assets(stage_name, stage_dir))
+    if not available_stage_dirs:
+        raise FileNotFoundError(
+            "No stage directories were available for summary. "
+            f"Requested stage dirs: { {name: str(path) for name, path in stage_dirs.items()} }"
+        )
 
     stage_metric_rows = [
         build_stage_metric_row(stage_name=stage_name, stage_dir=stage_dir)
-        for stage_name, stage_dir in stage_dirs.items()
+        for stage_name, stage_dir in available_stage_dirs.items()
     ]
     stage_metrics_frame = pd.DataFrame(stage_metric_rows)
     asset_index_frame = pd.DataFrame(discovered_asset_rows)
@@ -263,13 +278,15 @@ def main() -> None:
         output_dir / "summary.json",
         {
             "generated_at_utc": now_utc_iso(),
-            "stage_dirs": {name: str(path) for name, path in stage_dirs.items()},
-            "n_stages": len(stage_dirs),
+            "requested_stage_dirs": {name: str(path) for name, path in stage_dirs.items()},
+            "available_stage_dirs": {name: str(path) for name, path in available_stage_dirs.items()},
+            "n_stages": len(available_stage_dirs),
             "n_required_stage_artifacts": len(required_artifact_rows),
             "n_discovered_assets": len(discovered_asset_rows),
             "stage_metric_rows": stage_metric_rows,
             "required_artifact_rows": required_artifact_rows,
             "artifact_rows": discovered_asset_rows,
+            "skipped_stage_rows": skipped_stage_rows,
         },
     )
 
@@ -288,9 +305,8 @@ def main() -> None:
         {
             "stage_name": "summarize_model_runs",
             "output_dir": str(output_dir),
-            "main_dir": str(stage_dirs["main_model"]),
-            "report_dir": str(stage_dirs["report_model"]),
-            "failure_dir": str(stage_dirs["failure_mode"]),
+            "requested_stage_dirs": {name: str(path) for name, path in stage_dirs.items()},
+            "available_stage_dirs": {name: str(path) for name, path in available_stage_dirs.items()},
             "generated_at_utc": now_utc_iso(),
         },
     )
@@ -310,15 +326,20 @@ def main() -> None:
         "success": True,
         "output_dir": str(output_dir),
         "summary": [
-            {"name": "stage_count", "value": int(len(stage_dirs))},
+            {"name": "stage_count", "value": int(len(available_stage_dirs))},
             {"name": "stage_metric_rows", "value": int(len(stage_metrics_frame))},
             {"name": "report_asset_rows", "value": int(len(asset_index_frame))},
             {"name": "required_artifact_rows", "value": int(len(required_artifact_rows))},
+            {"name": "skipped_stage_rows", "value": int(len(skipped_stage_rows))},
         ],
         "artifact_checks": output_artifact_checks,
         "notes": [
-            "Verified required artifacts for main_model, report_model, and failure_mode before writing summary outputs.",
+            "Verified required artifacts for each available stage before writing summary outputs.",
             "Wrote compact CSV/Markdown comparison tables and a recursive report asset index, including plot files.",
+            *[
+                f"Skipped stage `{row['stage_name']}` because `{row['path']}` was missing."
+                for row in skipped_stage_rows
+            ],
         ],
     }
     write_validation_reports(output_dir, report)
@@ -327,14 +348,15 @@ def main() -> None:
         started_time,
         stage_name="summarize_model_runs",
         extra={
-            "stage_count": int(len(stage_dirs)),
+            "stage_count": int(len(available_stage_dirs)),
             "report_asset_rows": int(len(asset_index_frame)),
             "required_artifact_rows": int(len(required_artifact_rows)),
+            "skipped_stage_rows": int(len(skipped_stage_rows)),
         },
     )
     logger.info(
         "finished summary stage_count=%s asset_rows=%s output_dir=%s",
-        len(stage_dirs),
+        len(available_stage_dirs),
         len(asset_index_frame),
         output_dir,
     )

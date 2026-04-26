@@ -33,6 +33,20 @@ PREP_EMBED_MORPH="${PREP_EMBED_MORPH:-outputs/conic_liz/embed_morph.csv}"
 PREP_PATCH_FEATURES="${PREP_PATCH_FEATURES:-}"
 PREP_PATCH_ID_COL="${PREP_PATCH_ID_COL:-patch_id}"
 PREP_SLIDE_ID_COL="${PREP_SLIDE_ID_COL:-slide_id}"
+if [[ "${RUN_FAILURE}" == "1" ]]; then
+  DEFAULT_PREP_REQUIRED_CONSENSUS_METRICS="pq rq sq pixel_precision pixel_recall"
+  DEFAULT_PREP_AUTO_ENRICH_MISSING_METRICS="1"
+else
+  DEFAULT_PREP_REQUIRED_CONSENSUS_METRICS="pq"
+  DEFAULT_PREP_AUTO_ENRICH_MISSING_METRICS="0"
+fi
+PREP_REQUIRED_CONSENSUS_METRICS="${PREP_REQUIRED_CONSENSUS_METRICS:-${DEFAULT_PREP_REQUIRED_CONSENSUS_METRICS}}"
+PREP_AUTO_ENRICH_MISSING_METRICS="${PREP_AUTO_ENRICH_MISSING_METRICS:-${DEFAULT_PREP_AUTO_ENRICH_MISSING_METRICS}}"
+PREP_EVAL_DIR="${PREP_EVAL_DIR:-outputs/conic_liz}"
+PREP_EVAL_GLOB="${PREP_EVAL_GLOB:-*_evaluation.csv}"
+PREP_EVAL_FILES="${PREP_EVAL_FILES:-}"
+PREP_STATUS_COL="${PREP_STATUS_COL:-status}"
+PREP_STATUS_VALUES="${PREP_STATUS_VALUES:-ok}"
 MODEL_TABLE_OUTPUT="${MODEL_TABLE_OUTPUT:-${EXPERIMENT_DIR}/model_table/modeling_table.csv.gz}"
 
 COMMON_GROUP_COL="${COMMON_GROUP_COL:-slide_id}"
@@ -84,6 +98,9 @@ echo "[model_workflow_slurm] model_root=${MODEL_ROOT}"
 echo "[model_workflow_slurm] experiment_name=${EXPERIMENT_NAME}"
 echo "[model_workflow_slurm] experiment_dir=${EXPERIMENT_DIR}"
 echo "[model_workflow_slurm] model_table_output=${MODEL_TABLE_OUTPUT}"
+echo "[model_workflow_slurm] prep_required_consensus_metrics=${PREP_REQUIRED_CONSENSUS_METRICS}"
+echo "[model_workflow_slurm] prep_auto_enrich_missing_metrics=${PREP_AUTO_ENRICH_MISSING_METRICS}"
+echo "[model_workflow_slurm] prep_eval_dir=${PREP_EVAL_DIR}"
 echo "[model_workflow_slurm] main_output_dir=${MAIN_OUTPUT_DIR}"
 echo "[model_workflow_slurm] report_output_dir=${REPORT_OUTPUT_DIR}"
 echo "[model_workflow_slurm] failure_output_dir=${FAILURE_OUTPUT_DIR}"
@@ -113,13 +130,19 @@ run_command() {
 }
 
 if [[ "${RUN_PREP}" == "1" ]]; then
+  read -r -a prep_required_consensus_metrics <<< "${PREP_REQUIRED_CONSENSUS_METRICS}"
+  read -r -a prep_status_values <<< "${PREP_STATUS_VALUES}"
   prep_command=(
     pixi run -e default python scripts/benchmarking/model/01_build_model_table.py
     --joined-target-table "${PREP_JOINED_TARGET_TABLE}"
     --patch-id-col "${PREP_PATCH_ID_COL}"
     --slide-id-col "${PREP_SLIDE_ID_COL}"
+    --required-consensus-metrics "${prep_required_consensus_metrics[@]}"
     --output "${MODEL_TABLE_OUTPUT}"
   )
+  if [[ "${PREP_AUTO_ENRICH_MISSING_METRICS}" == "1" ]]; then
+    prep_command+=(--auto-enrich-missing-metrics)
+  fi
   if [[ -n "${PREP_EMBEDDINGS_INDEX}" ]]; then
     prep_command+=(--embeddings-index "${PREP_EMBEDDINGS_INDEX}")
   fi
@@ -128,6 +151,22 @@ if [[ "${RUN_PREP}" == "1" ]]; then
   fi
   if [[ -n "${PREP_PATCH_FEATURES}" ]]; then
     prep_command+=(--patch-features "${PREP_PATCH_FEATURES}")
+  fi
+  if [[ -n "${PREP_EVAL_DIR}" ]]; then
+    prep_command+=(--eval-dir "${PREP_EVAL_DIR}")
+  fi
+  if [[ -n "${PREP_EVAL_GLOB}" ]]; then
+    prep_command+=(--eval-glob "${PREP_EVAL_GLOB}")
+  fi
+  if [[ -n "${PREP_EVAL_FILES}" ]]; then
+    read -r -a prep_eval_files <<< "${PREP_EVAL_FILES}"
+    prep_command+=(--eval-files "${prep_eval_files[@]}")
+  fi
+  if [[ -n "${PREP_STATUS_COL}" ]]; then
+    prep_command+=(--status-col "${PREP_STATUS_COL}")
+  fi
+  if [[ "${#prep_status_values[@]}" -gt 0 ]]; then
+    prep_command+=(--status-values "${prep_status_values[@]}")
   fi
   run_command "${prep_command[@]}"
 fi
