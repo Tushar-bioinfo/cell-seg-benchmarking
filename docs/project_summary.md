@@ -89,6 +89,7 @@ If embedding space separates easy and hard patches in a stable way, pretrained p
 - `docs/evaluations.md`: current evaluation semantics and evaluation CSV behavior
 - `docs/embedding.md`: GigaPath embedding extraction inputs, outputs, and resume rules
 - `docs/morphology_labels_context.md`: morphology feature extraction inputs, outputs, and join behavior
+- `docs/modeling_context.md`: sklearn-first difficulty-modeling workflow, canonical modeling table, failure-mode enrichment, and Slurm behavior
 - `docs/conic_context.md`: CoNIC/Lizard class-label and count metadata when cell-type composition is needed
 
 ## Update Rule
